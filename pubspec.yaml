@@ -1,0 +1,36 @@
+name: mysuperwall_sdk
+description: Remotely configure and present mobile app paywalls with audience targeting, A/B experiments, offline caching, and your existing billing integration.
+version: 1.1.5
+homepage: https://mysuperwall.com
+repository: https://github.com/Unevenn/mysuperwall-flutter
+issue_tracker: https://github.com/Unevenn/mysuperwall-flutter/issues
+documentation: https://mysuperwall.com/docs/
+topics:
+  - paywall
+  - subscriptions
+  - monetization
+platforms:
+  android:
+  ios:
+
+environment:
+  sdk: ">=3.9.0 <4.0.0"
+  flutter: ">=3.35.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ">=1.2.1 <2.0.0"
+  webview_flutter: ">=4.7.0 <5.0.0"
+  package_info_plus: ">=9.0.0 <11.0.0"
+  logger: ">=2.4.0 <3.0.0"
+  shimmer: ">=3.0.0 <5.0.0"
+  shared_preferences: ">=2.5.4 <3.0.0"
+  uuid: ">=4.5.3 <5.0.0"
+  device_info_plus: ">=11.5.0 <14.0.0"
+  crypto: ">=3.0.3 <4.0.0"
+
+dev_dependencies:
+  lints: ^6.1.0
+  flutter_test:
+    sdk: flutter

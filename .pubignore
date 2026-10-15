@@ -1,0 +1,33 @@
+# Generated files and local configuration
+.dart_tool/
+**/.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+**/build/
+.DS_Store
+**/.DS_Store
+pubspec.lock
+**/pubspec.lock
+.env
+.env.*
+**/.env
+**/.env.*
+*.jks
+*.keystore
+*.p12
+*.p8
+*.pem
+# Keep the Dart integration example, exclude generated platform projects.
+example/android/
+example/ios/
+example/linux/
+example/macos/
+example/windows/
+example/web/
+example/.idea/
+example/.vscode/
+# Repository-only material
+/docs/
+/test/

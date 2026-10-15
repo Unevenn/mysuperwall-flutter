@@ -1,0 +1,24 @@
+name: mysuperwall_example
+description: Example application demonstrating MySuperWall SDK integration.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mysuperwall_sdk:
+    path: ../
+  # Add other dependencies your app uses, like revenue_cat or other in-app purchase libraries
+  # These are optional but typically used alongside the paywall
+  # in_app_purchase: ^3.1.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
