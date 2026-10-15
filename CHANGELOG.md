@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.6 - 2026-10-15
+
+- Invalidate rendered manifest, disk paywall cache and prepared WebViews when store product data changes; refresh the manifest with the current localized prices.
+- Apply the same invalidation to legacy product-loading methods and snapshot product payloads against external mutation.
+
 ## 1.1.5 - 2026-10-15
 
 - Document manifest and rule evaluation APIs.

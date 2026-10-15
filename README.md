@@ -41,7 +41,7 @@ Design in MySuperWall. Publish remotely. Show the right paywall in your app — 
 
 ```yaml
 dependencies:
-  mysuperwall_sdk: ^1.1.5
+  mysuperwall_sdk: ^1.1.6
 ```
 
 Requires **Flutter 3.35+ / Dart 3.9+**. Supports **iOS and Android**.

@@ -72,6 +72,7 @@ class MySuperWallClient {
   final bool failOpenOnNetworkError;
   final Map<String, DateTime> _paywallCachedAt = {};
   final Map<String, dynamic> _productData = {};
+  int _productDataRevision = 0;
   final Map<String, PaywallResult> _paywallCache = {};
   final LinkedHashMap<String, PreparedPaywallController> _preparedPaywallPool =
       LinkedHashMap<String, PreparedPaywallController>();
@@ -124,7 +125,7 @@ class MySuperWallClient {
        timeout = timeout ?? const Duration(seconds: 8);
 
   void loadProducts(Map<String, String> prices) {
-    _productData.addAll(prices);
+    unawaited(setProductData(prices, replace: false));
   }
 
   Map<String, String> get productPrices => Map<String, String>.unmodifiable(
@@ -145,7 +146,7 @@ class MySuperWallClient {
       Map<String, dynamic>.unmodifiable(_productData);
 
   void loadProductData(Map<String, dynamic> productData) {
-    _productData.addAll(productData);
+    unawaited(setProductData(productData, replace: false));
   }
 
   int _preparedPriorityFor(String triggerKey) =>
@@ -395,15 +396,39 @@ class MySuperWallClient {
     bool replace = true,
     bool clearCachedPaywalls = false,
   }) async {
+    // Rendered HTML contains store prices. A product update invalidates every
+    // representation, including the offline manifest and prepared WebViews.
+    final previous = jsonEncode(_productData);
+    final captured =
+        jsonDecode(jsonEncode(productData)) as Map<String, dynamic>;
     if (replace) {
       _productData
         ..clear()
-        ..addAll(productData);
+        ..addAll(captured);
     } else {
-      _productData.addAll(productData);
+      _productData.addAll(captured);
     }
-
-    if (clearCachedPaywalls) {
+    final changed = previous != jsonEncode(_productData);
+    if (changed) {
+      final revision = ++_productDataRevision;
+      final scope = _cacheScope;
+      // clear() invalidates the in-memory manifest and pending fetches before
+      // its first await, so no stale USD HTML remains eligible for local rules.
+      final manifestClear = _manifestService?.clear(scope).catchError((
+        Object error,
+      ) {
+        _logger.w(
+          '[MySuperWall] Could not remove stale price manifest: $error',
+        );
+      });
+      await this.clearCachedPaywalls();
+      if (manifestClear != null) {
+        await manifestClear;
+      }
+      if (revision == _productDataRevision && scope == _cacheScope) {
+        await _syncManifestInBackground();
+      }
+    } else if (clearCachedPaywalls) {
       await this.clearCachedPaywalls();
     }
 
