@@ -1,3 +1,4 @@
+import 'sdk_logging.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'package:uuid/uuid.dart';
@@ -12,7 +13,7 @@ class OfflineEventQueue {
     Logger? logger,
     this.flushInterval = const Duration(seconds: 15),
     this.maxBatchSize = 10,
-  }) : _logger = logger ?? Logger() {
+  }) : _logger = logger ?? MySuperWallLogging.createLogger() {
     _loadQueueFromDisk();
     _startPeriodicFlush();
   }

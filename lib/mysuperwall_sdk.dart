@@ -17,3 +17,5 @@ export 'src/exceptions/mysuperwall_exception.dart';
 export 'src/ui/paywall_host.dart';
 export 'src/ui/paywall_view.dart';
 export 'src/models/purchase_verification.dart';
+export 'src/models/log_level.dart';
+export 'src/models/paywall_state.dart';

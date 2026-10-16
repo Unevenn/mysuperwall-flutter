@@ -1,3 +1,4 @@
+import '../services/sdk_logging.dart';
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -69,7 +70,7 @@ Offset preparedPaywallBeginFractionalOffset(
 class _MySuperWallHostState extends State<MySuperWallHost>
     with WidgetsBindingObserver {
   static bool _hasLoggedMounted = false;
-  static final Logger _logger = Logger(
+  static final Logger _logger = MySuperWallLogging.createLogger(
     printer: PrettyPrinter(
       methodCount: 0,
       errorMethodCount: 3,
@@ -148,12 +149,26 @@ class _MySuperWallHostState extends State<MySuperWallHost>
         return Stack(
           fit: StackFit.expand,
           children: [
-            widget.child,
+            // Keep native WebViews mounted before their first presentation.
+            // Offstage or zero opacity would prevent useful pre-painting.
+            for (final entry
+                in MySuperWallClient
+                    .instance
+                    .preparedPaywallControllers
+                    .entries)
+              if (entry.key != activeEntry?.key)
+                _PreparedLayer(
+                  key: ObjectKey(entry.value),
+                  controller: entry.value,
+                  isActive: false,
+                ),
+            KeyedSubtree(
+              key: const ValueKey('mysuperwall_host_content'),
+              child: widget.child,
+            ),
             if (activeEntry != null)
               _PreparedLayer(
-                key: ValueKey(
-                  'active_${activeEntry.key}_${activeEntry.value.presentationSession}',
-                ),
+                key: ObjectKey(activeEntry.value),
                 controller: activeEntry.value,
                 isActive: true,
               ),
@@ -213,7 +228,7 @@ class _MySuperWallHostState extends State<MySuperWallHost>
 }
 
 class _PreparedLayer extends StatefulWidget {
-  static final Logger _logger = Logger(
+  static final Logger _logger = MySuperWallLogging.createLogger(
     printer: PrettyPrinter(
       methodCount: 0,
       errorMethodCount: 3,
@@ -240,6 +255,8 @@ class _PreparedLayerState extends State<_PreparedLayer>
     with SingleTickerProviderStateMixin {
   late final AnimationController _transitionController;
   double _dragOffset = 0;
+  bool _isPreparingPresentation = false;
+  int _animationRequest = 0;
   int _lastPresentationSession = 0;
 
   @override
@@ -290,38 +307,45 @@ class _PreparedLayerState extends State<_PreparedLayer>
       ],
     );
 
-    return IgnorePointer(
-      ignoring: !widget.isActive,
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          return AnimatedBuilder(
-            animation: _transitionController,
-            child: paywallContent,
-            builder: (context, child) {
-              final curve = _dragOffset > 0
-                  ? Curves.linear
-                  : _buildCurve(presentation);
-              final value = curve.transform(_transitionController.value);
-              final fractionalOffset = Offset.lerp(
-                _buildFractionalBeginOffset(presentation),
-                Offset.zero,
-                value,
-              )!;
-              final translatedOffset = Offset(
-                (fractionalOffset.dx * constraints.maxWidth) + _dragOffset,
-                fractionalOffset.dy * constraints.maxHeight,
-              );
+    return ExcludeSemantics(
+      excluding: !widget.isActive || _isPreparingPresentation,
+      child: IgnorePointer(
+        ignoring: !widget.isActive || _isPreparingPresentation,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return AnimatedBuilder(
+              animation: _transitionController,
+              child: paywallContent,
+              builder: (context, child) {
+                final curve = _dragOffset > 0
+                    ? Curves.linear
+                    : _buildCurve(presentation);
+                final value = curve.transform(_transitionController.value);
+                final fractionalOffset = Offset.lerp(
+                  _buildFractionalBeginOffset(presentation),
+                  Offset.zero,
+                  value,
+                )!;
+                final translatedOffset = Offset(
+                  (fractionalOffset.dx * constraints.maxWidth) + _dragOffset,
+                  fractionalOffset.dy * constraints.maxHeight,
+                );
 
-              return Opacity(
-                opacity: _buildOpacity(presentation, value),
-                child: Transform.translate(
-                  offset: translatedOffset,
-                  child: child,
-                ),
-              );
-            },
-          );
-        },
+                return Opacity(
+                  opacity: !widget.isActive || _isPreparingPresentation
+                      ? 0.001
+                      : _buildOpacity(presentation, value),
+                  child: Transform.translate(
+                    offset: !widget.isActive || _isPreparingPresentation
+                        ? Offset.zero
+                        : translatedOffset,
+                    child: child,
+                  ),
+                );
+              },
+            );
+          },
+        ),
       ),
     );
   }
@@ -337,11 +361,14 @@ class _PreparedLayerState extends State<_PreparedLayer>
             nextPresentationSession != _lastPresentationSession);
 
     if (shouldStartPresentation) {
-      _startPresentationAnimation();
+      _startPresentationAnimation(waitForMount: false);
       return;
     }
 
     if (!widget.isActive && oldWidget.isActive) {
+      _animationRequest++;
+      _isPreparingPresentation = false;
+      _transitionController.stop();
       _transitionController.value = 0;
       _dragOffset = 0;
     }
@@ -349,6 +376,7 @@ class _PreparedLayerState extends State<_PreparedLayer>
 
   @override
   void dispose() {
+    _animationRequest++;
     _transitionController.dispose();
     super.dispose();
   }
@@ -362,12 +390,25 @@ class _PreparedLayerState extends State<_PreparedLayer>
       value: widget.isActive ? 0 : 1,
       duration: _buildDuration(widget.controller.paywall.presentation),
     );
+    _transitionController.addStatusListener(_handleAnimationStatus);
     if (widget.isActive) {
       _startPresentationAnimation();
     }
   }
 
-  void _startPresentationAnimation() {
+  void _handleAnimationStatus(AnimationStatus status) {
+    if (status == AnimationStatus.completed &&
+        widget.isActive &&
+        !_isPreparingPresentation) {
+      widget.controller.presentationCompleted(
+        isVisible: () =>
+            mounted && widget.isActive && !_isPreparingPresentation,
+      );
+    }
+  }
+
+  void _startPresentationAnimation({bool waitForMount = true}) {
+    final request = ++_animationRequest;
     final presentation = widget.controller.paywall.presentation;
     final duration = _buildDuration(presentation);
     _lastPresentationSession = widget.controller.presentationSession;
@@ -375,10 +416,34 @@ class _PreparedLayerState extends State<_PreparedLayer>
     _dragOffset = 0;
 
     if (duration == Duration.zero) {
+      _isPreparingPresentation = false;
       _transitionController.value = 1;
+      widget.controller.presentationCompleted(
+        isVisible: () =>
+            mounted && widget.isActive && !_isPreparingPresentation,
+      );
       return;
     }
 
+    if (!waitForMount) {
+      _isPreparingPresentation = false;
+      _transitionController.forward(from: 0);
+      return;
+    }
+
+    _isPreparingPresentation = true;
+    _transitionController.value = 0;
+    unawaited(_animateAfterMount(request));
+  }
+
+  Future<void> _animateAfterMount(int request) async {
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || request != _animationRequest || !widget.isActive) {
+      return;
+    }
+    setState(() {
+      _isPreparingPresentation = false;
+    });
     _transitionController.forward(from: 0);
   }
 

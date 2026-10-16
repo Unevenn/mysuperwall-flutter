@@ -1,3 +1,6 @@
+import '../models/paywall_state.dart';
+import '../services/sdk_endpoint.dart';
+import '../services/sdk_logging.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:io';
@@ -10,6 +13,7 @@ import '../models/paywall_data.dart';
 
 class PaywallCallbacks {
   const PaywallCallbacks({
+    this.onShown,
     this.onPurchase,
     this.onRestore,
     this.onDismiss,
@@ -18,6 +22,7 @@ class PaywallCallbacks {
     this.onOpenPrivacy,
   });
 
+  final VoidCallback? onShown;
   final void Function(String productId)? onPurchase;
   final VoidCallback? onRestore;
   final void Function(int durationInSeconds)? onDismiss;
@@ -26,14 +31,64 @@ class PaywallCallbacks {
   final ValueChanged<String?>? onOpenPrivacy;
 }
 
-class PreparedPaywallController {
-  PreparedPaywallController({required this.paywall});
+class PreparedPaywallController with WidgetsBindingObserver {
+  PreparedPaywallController({required this.paywall, this.onStateChanged});
+
+  final ValueChanged<MySuperWallPaywallState>? onStateChanged;
+  bool _hasPaintSignal = false;
+  bool _loadFailed = false;
+  bool _presentationFinished = false;
+  bool _shownReported = false;
+  bool Function()? _isPresentationVisible;
+
+  void presentationCompleted({required bool Function() isVisible}) {
+    _isPresentationVisible = isVisible;
+    _presentationFinished = true;
+    _reportVisibleAfterFrame();
+  }
+
+  void _reportVisibleAfterFrame() {
+    final session = _presentationSession;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final lifecycle = WidgetsBinding.instance.lifecycleState;
+      if (_disposed ||
+          _callbacks == null ||
+          session != _presentationSession ||
+          _shownReported ||
+          !_presentationFinished ||
+          !_hasPaintSignal ||
+          _loadFailed ||
+          _isPresentationVisible?.call() != true ||
+          (lifecycle != null && lifecycle != AppLifecycleState.resumed))
+        return;
+      _shownReported = true;
+      _openedAt = DateTime.now();
+      onStateChanged?.call(MySuperWallPaywallState.visible);
+      _callbacks?.onShown?.call();
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _reportVisibleAfterFrame();
+  }
+
+  void _markFailed() {
+    if (_disposed) return;
+    _loadFailed = true;
+    isLoading.value = false;
+    isReady.value = false;
+    final completer = _readyCompleter;
+    if (completer != null && !completer.isCompleted) completer.complete();
+    onStateChanged?.call(MySuperWallPaywallState.failed);
+  }
 
   static const Color defaultBackgroundColor = Color(0x00000000);
   static const Color fallbackBackgroundColor = Color(0x00000000);
   static const Duration _readyFallbackDelay = Duration(milliseconds: 700);
 
-  static final Logger _logger = Logger(
+  static final Logger _logger = MySuperWallLogging.createLogger(
     printer: PrettyPrinter(
       methodCount: 0,
       errorMethodCount: 3,
@@ -49,6 +104,7 @@ class PreparedPaywallController {
   final ValueNotifier<bool> isLoading = ValueNotifier(true);
   final ValueNotifier<bool> isReady = ValueNotifier(false);
 
+  bool _disposed = false;
   bool _configured = false;
   bool _warmed = false;
   bool _hasLoggedReady = false;
@@ -65,13 +121,28 @@ class PreparedPaywallController {
       _openedAt == null ? 0 : DateTime.now().difference(_openedAt!).inSeconds;
 
   void activate(PaywallCallbacks callbacks) {
+    WidgetsBinding.instance.removeObserver(this);
+    WidgetsBinding.instance.addObserver(this);
     _callbacks = callbacks;
-    _openedAt = DateTime.now();
+    _presentationFinished = false;
+    _isPresentationVisible = null;
+    _shownReported = false;
+    _openedAt = null;
+    onStateChanged?.call(
+      _loadFailed
+          ? MySuperWallPaywallState.failed
+          : MySuperWallPaywallState.presenting,
+    );
     _presentationSession++;
   }
 
   void deactivate() {
+    WidgetsBinding.instance.removeObserver(this);
+    if (!_disposed && _callbacks != null) {
+      onStateChanged?.call(MySuperWallPaywallState.dismissed);
+    }
     _callbacks = null;
+    _isPresentationVisible = null;
     _openedAt = null;
   }
 
@@ -79,7 +150,8 @@ class PreparedPaywallController {
     _callbacks?.onDismiss?.call(activeDurationInSeconds);
   }
 
-  Future<void> warm({required String baseUrl}) async {
+  Future<void> warm() async {
+    if (_disposed) return;
     if (!_configured) {
       _configureController();
     }
@@ -87,7 +159,13 @@ class PreparedPaywallController {
       return;
     }
 
-    await controller.loadHtmlString(buildHtml(baseUrl, paywall.html));
+    onStateChanged?.call(MySuperWallPaywallState.loading);
+    try {
+      await controller.loadHtmlString(buildHtml(sdkServiceUrl, paywall.html));
+    } catch (_) {
+      _markFailed();
+      rethrow;
+    }
     _warmed = true;
     _logger.i(
       '[MySuperWall] Prepared paywall warmed for trigger "${paywall.triggerKey}".',
@@ -97,6 +175,7 @@ class PreparedPaywallController {
   Future<bool> waitUntilReady({
     Duration timeout = const Duration(seconds: 4),
   }) async {
+    if (_disposed) return false;
     if (isReady.value) {
       return true;
     }
@@ -105,10 +184,15 @@ class PreparedPaywallController {
     try {
       await completer.future.timeout(timeout);
     } catch (_) {}
-    return isReady.value;
+    return !_disposed && isReady.value;
   }
 
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _loadGeneration++;
+    final completer = _readyCompleter;
+    if (completer != null && !completer.isCompleted) completer.complete();
     deactivate();
     isLoading.dispose();
     isReady.dispose();
@@ -121,14 +205,26 @@ class PreparedPaywallController {
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: (String url) {
+            if (_disposed) return;
             _loadGeneration++;
+            _hasPaintSignal = false;
+            _loadFailed = false;
+            onStateChanged?.call(
+              _callbacks == null
+                  ? MySuperWallPaywallState.loading
+                  : MySuperWallPaywallState.presenting,
+            );
             isLoading.value = true;
             isReady.value = false;
             if (_readyCompleter == null || _readyCompleter!.isCompleted) {
               _readyCompleter = Completer<void>();
             }
           },
+          onWebResourceError: (error) {
+            if (error.isForMainFrame == true) _markFailed();
+          },
           onPageFinished: (String url) {
+            if (_disposed) return;
             final finishedGeneration = _loadGeneration;
             unawaited(_markReadyFallback(finishedGeneration));
             if (Platform.isAndroid) {
@@ -179,7 +275,13 @@ class PreparedPaywallController {
       ..addJavaScriptChannel(
         'MySuperWallReady',
         onMessageReceived: (_) {
+          if (_disposed || _loadFailed) return;
+          _hasPaintSignal = true;
           unawaited(_markReadyAfterPaint(_loadGeneration));
+          if (_callbacks == null) {
+            onStateChanged?.call(MySuperWallPaywallState.ready);
+          }
+          _reportVisibleAfterFrame();
         },
       );
 
@@ -187,7 +289,10 @@ class PreparedPaywallController {
   }
 
   void _completeReady(int generation) {
-    if (generation != _loadGeneration || isReady.value) {
+    if (_disposed ||
+        _loadFailed ||
+        generation != _loadGeneration ||
+        isReady.value) {
       return;
     }
 
@@ -219,6 +324,7 @@ class PreparedPaywallController {
   window.__mySuperWallPaintReadyInstalled = true;
 
   var notifyReady = function () {
+    if (document.readyState !== 'complete') return;
     try {
       if (window.MySuperWallReady && window.MySuperWallReady.postMessage) {
         window.MySuperWallReady.postMessage('paint-ready');

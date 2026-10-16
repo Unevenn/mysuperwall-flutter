@@ -270,3 +270,45 @@ RevenueCat totals for the same transactions. Backend contract:
 [Integration documentation](https://mysuperwall.com/docs/) · [Changelog](https://pub.dev/packages/mysuperwall_sdk/changelog) · [GitHub](https://github.com/Unevenn/mysuperwall-flutter)
 
 Illustrated paywalls in the header demonstrate visual possibilities, rather than bundled templates. Licensed under [MIT](https://pub.dev/packages/mysuperwall_sdk/license).
+
+### SDK log level
+
+SDK logging defaults to `MySuperWallLogLevel.warning` (warnings and errors),
+including in release builds. Configure it during initialization:
+
+```dart
+await MySuperWallClient.initialize(
+  appKey: 'YOUR_APP_KEY',
+  logLevel: MySuperWallLogLevel.warning,
+);
+```
+
+Use `all` for every SDK message, `error` for errors only, or `none` to disable
+SDK logging. Change it at runtime with
+`MySuperWallClient.setLogLevel(MySuperWallLogLevel.none)`.
+This setting does not change your application's own logs.
+
+### Paywall lifecycle
+
+Read the current state of a trigger or listen for changes:
+
+```dart
+final sdk = MySuperWallClient.instance;
+final state = sdk.paywallStateFor('location');
+
+void onPaywallStatesChanged() {
+  final state = sdk.paywallStateFor('location');
+  // Update your application's controller using this state.
+}
+
+sdk.paywallStates.addListener(onPaywallStatesChanged);
+// Remove the listener when your application's controller is disposed:
+sdk.paywallStates.removeListener(onPaywallStatesChanged);
+```
+
+States are `idle`, `loading`, `ready`, `presenting`, `visible`, `dismissed`, and
+`failed`. They describe each trigger, including background preparation.
+`paywall_shown` is emitted at most once per presentation, after the opening
+transition finishes and the WebView reports paint readiness, while the paywall
+is active and the app is in the foreground. A readiness timeout alone does not
+count as an impression. This does not delay the opening animation.

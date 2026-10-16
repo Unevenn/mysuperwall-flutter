@@ -1,3 +1,12 @@
+## 1.2.0
+
+- Keep prepared WebViews mounted so the first opening can animate without a fixed paint timeout.
+- Add SDK log levels (`all`, `warning`, `error`, `none`), defaulting to warnings and errors.
+- Use the fixed MySuperWall endpoint and remove the client base URL API.
+- Prevent concurrent presentations and clean up timers, queues and prepared controllers on disposal.
+- Expose per-trigger lifecycle states and emit impressions once after transition and WebView paint readiness while foregrounded.
+- Preserve localized store price cache invalidation from 1.1.6.
+
 # Changelog
 
 ## 1.1.6 - 2026-10-15

@@ -1,3 +1,4 @@
+import 'sdk_logging.dart';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:logger/logger.dart';
@@ -10,7 +11,7 @@ class ManifestService {
     required this.preferences,
     required this.httpClient,
     Logger? logger,
-  }) : _logger = logger ?? Logger();
+  }) : _logger = logger ?? MySuperWallLogging.createLogger();
 
   final SharedPreferences preferences;
   final http.Client httpClient;

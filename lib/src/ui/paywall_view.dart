@@ -1,3 +1,4 @@
+import '../services/sdk_logging.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -15,6 +16,8 @@ import 'paywall_session.dart';
 
 class PaywallView extends StatefulWidget {
   static VoidCallback? _currentDismiss;
+
+  static bool get isShowing => _currentDismiss != null;
   final PaywallData paywall;
   final Function(String productId)? onPurchase;
   final VoidCallback? onDismiss;
@@ -79,14 +82,16 @@ class PaywallView extends StatefulWidget {
 
     final route = _buildRoute(paywall.presentation, routeBuilder);
 
-    _currentDismiss = () {
+    void dismissRoute() {
       if (route.isActive && context.mounted) {
         Navigator.of(context).removeRoute(route);
       }
-    };
+    }
+
+    _currentDismiss = dismissRoute;
 
     route.popped.then((_) {
-      if (_currentDismiss != null) {
+      if (identical(_currentDismiss, dismissRoute)) {
         _currentDismiss = null;
       }
     });
@@ -279,8 +284,38 @@ class _PaywallViewState extends State<PaywallView> {
     );
   }
 
+  Animation<double>? _routeAnimation;
+
+  void _handleRouteAnimation(AnimationStatus status) {
+    if (status == AnimationStatus.completed &&
+        mounted &&
+        ModalRoute.of(context)?.isCurrent == true) {
+      _preparedController.presentationCompleted(
+        isVisible: () =>
+            mounted &&
+            !_didHandleDismiss &&
+            ModalRoute.of(context)?.isCurrent == true,
+      );
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final animation = ModalRoute.of(context)?.animation;
+    if (!identical(animation, _routeAnimation)) {
+      _routeAnimation?.removeStatusListener(_handleRouteAnimation);
+      _routeAnimation = animation;
+      animation?.addStatusListener(_handleRouteAnimation);
+    }
+    if (animation == null || animation.status == AnimationStatus.completed) {
+      _handleRouteAnimation(AnimationStatus.completed);
+    }
+  }
+
   @override
   void dispose() {
+    _routeAnimation?.removeStatusListener(_handleRouteAnimation);
     unawaited(AndroidPaywallBackBridge.setPaywallVisible(false));
     _preparedController.deactivate();
     if (_ownsPreparedController || widget.disposeProvidedPreparedController) {
@@ -292,9 +327,6 @@ class _PaywallViewState extends State<PaywallView> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) widget.onShown?.call();
-    });
     unawaited(AndroidPaywallBackBridge.setPaywallVisible(true));
     _ownsPreparedController = widget.preparedController == null;
     _preparedController =
@@ -302,6 +334,7 @@ class _PaywallViewState extends State<PaywallView> {
         PreparedPaywallController(paywall: widget.paywall);
     _preparedController.activate(
       PaywallCallbacks(
+        onShown: widget.onShown,
         onPurchase: widget.onPurchase,
         onRestore: widget.onRestore,
         onOpenUrl: widget.onOpenUrl,
@@ -314,11 +347,11 @@ class _PaywallViewState extends State<PaywallView> {
       ),
     );
 
-    _preparedController
-        .warm(baseUrl: MySuperWallClient.instance.baseUrl)
-        .catchError((Object error) {
-          debugPrint('[MySuperWall] Failed to warm paywall view: $error');
-        });
+    _preparedController.warm().catchError((Object error) {
+      MySuperWallLogging.logger.w(
+        '[MySuperWall] Failed to warm paywall view: $error',
+      );
+    });
   }
 
   void _handleDismiss({int? durationInSeconds, required bool popRoute}) {
@@ -327,13 +360,16 @@ class _PaywallViewState extends State<PaywallView> {
     }
 
     _didHandleDismiss = true;
-    MySuperWallClient.instance.trackDismiss(
-      paywallId: widget.paywall.id,
-      triggerKey: widget.paywall.triggerKey,
-      duration:
-          durationInSeconds ?? _preparedController.activeDurationInSeconds,
-      abVariant: widget.paywall.abVariant,
-    );
+    final visibleDuration =
+        durationInSeconds ?? _preparedController.activeDurationInSeconds;
+    _preparedController.deactivate();
+    if (MySuperWallClient.isInitialized)
+      MySuperWallClient.instance.trackDismiss(
+        paywallId: widget.paywall.id,
+        triggerKey: widget.paywall.triggerKey,
+        duration: visibleDuration,
+        abVariant: widget.paywall.abVariant,
+      );
 
     if (popRoute && mounted) {
       Navigator.of(context).pop();

@@ -1,3 +1,8 @@
+import 'package:flutter/foundation.dart';
+import 'models/paywall_state.dart';
+import 'services/sdk_endpoint.dart';
+import 'models/log_level.dart';
+import 'services/sdk_logging.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:collection';
@@ -30,7 +35,6 @@ import 'ui/paywall_session.dart';
 class MySuperWallClient {
   static MySuperWallClient? _instance;
   static int _hostMountCount = 0;
-  static const String defaultBaseUrl = 'https://mysuperwall.com/';
   static const String _sdkValidationCacheKey =
       'mysuperwall_sdk_validation_cache';
   static const String _paywallCacheSchemaVersionKey =
@@ -50,7 +54,6 @@ class MySuperWallClient {
     'missing_app_identifier',
   };
 
-  final String baseUrl;
   final String? appKey; // Optional if package identifier is used
   String? _userId; // Centralized user ID
   String? _locale = Platform.localeName.replaceAll('_', '-').toLowerCase();
@@ -66,6 +69,31 @@ class MySuperWallClient {
   void setSubscriptionStatus(bool premium) {
     _subscriptionPremium = premium;
   }
+
+  final ValueNotifier<Map<String, MySuperWallPaywallState>> _paywallStates =
+      ValueNotifier(const {});
+
+  /// Listen for lifecycle changes without modifying SDK state.
+  ValueListenable<Map<String, MySuperWallPaywallState>> get paywallStates =>
+      _paywallStates;
+
+  MySuperWallPaywallState paywallStateFor(String triggerKey) =>
+      _paywallStates.value[triggerKey] ?? MySuperWallPaywallState.idle;
+
+  void _updatePaywallState(String triggerKey, MySuperWallPaywallState state) {
+    if (_disposed || paywallStateFor(triggerKey) == state) return;
+    _paywallStates.value = Map.unmodifiable({
+      ..._paywallStates.value,
+      triggerKey: state,
+    });
+  }
+
+  bool _disposed = false;
+  bool _presentationInProgress = false;
+  bool get _hasActivePresentation =>
+      _presentationInProgress ||
+      _activePreparedTriggerKey.value != null ||
+      PaywallView.isShowing;
 
   final http.Client _httpClient;
   final Duration timeout;
@@ -102,7 +130,7 @@ class MySuperWallClient {
   static Route<void>? _preparedBackInterceptorRoute;
   static NavigatorState? _preparedBackInterceptorNavigator;
 
-  static final Logger _logger = Logger(
+  static final Logger _logger = MySuperWallLogging.createLogger(
     printer: PrettyPrinter(
       methodCount: 0,
       errorMethodCount: 5,
@@ -114,7 +142,6 @@ class MySuperWallClient {
   );
 
   MySuperWallClient._({
-    required this.baseUrl,
     this.appKey,
     String? userId,
     http.Client? httpClient,
@@ -546,6 +573,13 @@ class MySuperWallClient {
     }
   }
 
+  /// Changes logging immediately for all SDK components.
+  static void setLogLevel(MySuperWallLogLevel level) {
+    MySuperWallLogging.level = level;
+  }
+
+  static MySuperWallLogLevel get logLevel => MySuperWallLogging.level;
+
   /// Initializes the MySuperWall SDK instance.
   static Future<MySuperWallClient> initialize({
     String? appKey,
@@ -553,7 +587,9 @@ class MySuperWallClient {
     http.Client? httpClient,
     Duration requestTimeout = const Duration(seconds: 8),
     bool failOpenOnNetworkError = true,
+    MySuperWallLogLevel logLevel = MySuperWallLogLevel.warning,
   }) async {
+    setLogLevel(logLevel);
     try {
       final prefs = await SharedPreferences.getInstance();
       if (userId == null || userId.trim().isEmpty) {
@@ -565,7 +601,6 @@ class MySuperWallClient {
       }
 
       final client = MySuperWallClient._(
-        baseUrl: defaultBaseUrl,
         appKey: appKey,
         userId: userId,
         httpClient: httpClient,
@@ -601,6 +636,7 @@ class MySuperWallClient {
       // Compute which lifecycle triggers apply this session
       await client._computeLifecycleTriggers(prefs);
 
+      _instance?.dispose();
       _instance = client;
       return client;
     } catch (e) {
@@ -624,7 +660,7 @@ class MySuperWallClient {
     try {
       response = await _httpClient
           .post(
-            Uri.parse('${baseUrl}paywall/sdk-init'),
+            Uri.parse('${sdkServiceUrl}paywall/sdk-init'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode(body),
           )
@@ -681,8 +717,9 @@ class MySuperWallClient {
   Future<void> _syncManifestInBackground() async {
     try {
       final appInfo = await PackageInfo.fromPlatform();
+      if (_disposed) return;
       await _manifestService?.fetchManifest(
-        baseUrl: baseUrl,
+        baseUrl: sdkServiceUrl,
         scope: _cacheScope,
         appKey: appKey,
         bundleId: Platform.isIOS ? appInfo.packageName : null,
@@ -701,8 +738,9 @@ class MySuperWallClient {
   Future<void> _flushEventQueue() async {
     try {
       final appInfo = await PackageInfo.fromPlatform();
+      if (_disposed) return;
       await _eventQueue?.flush(
-        baseUrl: baseUrl,
+        baseUrl: sdkServiceUrl,
         appKey: appKey,
         bundleId: Platform.isIOS ? appInfo.packageName : null,
         packageName: Platform.isAndroid ? appInfo.packageName : null,
@@ -882,7 +920,8 @@ class MySuperWallClient {
     return '';
   }
 
-  String get _cacheScope => jsonEncode([baseUrl, appKey, _userId, _locale]);
+  String get _cacheScope =>
+      jsonEncode([sdkServiceUrl, appKey, _userId, _locale]);
 
   void _clearIdentityState() {
     _flowGeneration++;
@@ -1006,7 +1045,7 @@ class MySuperWallClient {
   Future<bool> healthCheck() async {
     try {
       final response = await _httpClient
-          .get(Uri.parse('${baseUrl}health'))
+          .get(Uri.parse('${sdkServiceUrl}health'))
           .timeout(const Duration(seconds: 5));
       return response.statusCode == 200;
     } catch (_) {
@@ -1166,7 +1205,7 @@ class MySuperWallClient {
 
     final scope = _cacheScope;
     await _stashAssetsAsBase64(result.paywall!);
-    if (_cacheScope != scope) return;
+    if (_disposed || _cacheScope != scope) return;
     final productDetails = <String>[];
     for (final productId in result.paywall!.productIds) {
       final data = _productData[productId];
@@ -1189,7 +1228,7 @@ class MySuperWallClient {
     _paywallCache[triggerKey] = result;
     await _saveToDisk(triggerKey, result);
     await _preparePaywallController(triggerKey, result);
-    if (_cacheScope != scope) _clearIdentityState();
+    if (_disposed || _cacheScope != scope) _clearIdentityState();
   }
 
   void _trimPreparedPaywallPool() {
@@ -1286,12 +1325,14 @@ class MySuperWallClient {
 
     final preparedController = PreparedPaywallController(
       paywall: result.paywall!,
+      onStateChanged: (state) =>
+          _updatePaywallState(result.paywall!.triggerKey, state),
     );
     _preparedPaywallPool[triggerKey] = preparedController;
     _preparedPoolVersion.value++;
     await WidgetsBinding.instance.endOfFrame;
     try {
-      await preparedController.warm(baseUrl: baseUrl);
+      await preparedController.warm();
     } catch (e) {
       _preparedPaywallPool.remove(triggerKey)?.dispose();
       _preparedPoolVersion.value++;
@@ -1304,8 +1345,10 @@ class MySuperWallClient {
   ) async {
     final preparedController = PreparedPaywallController(
       paywall: result.paywall!,
+      onStateChanged: (state) =>
+          _updatePaywallState(result.paywall!.triggerKey, state),
     );
-    await preparedController.warm(baseUrl: baseUrl);
+    await preparedController.warm();
     await preparedController.waitUntilReady(
       timeout: const Duration(seconds: 8),
     );
@@ -1331,6 +1374,7 @@ class MySuperWallClient {
     final presentationScope = _cacheScope;
 
     Future<void> showPreparedPaywall() async {
+      if (_disposed || _activePreparedTriggerKey.value == triggerKey) return;
       if (_preparedPaywallPool[triggerKey] != preparedController) {
         return;
       }
@@ -1347,6 +1391,14 @@ class MySuperWallClient {
 
       preparedController.activate(
         PaywallCallbacks(
+          onShown: () {
+            if (!_disposed &&
+                presentationScope == _cacheScope &&
+                _activePreparedTriggerKey.value == triggerKey &&
+                isHostMounted) {
+              _trackDisplayedEvent('paywall_shown', paywall, triggerKey);
+            }
+          },
           onPurchase: (pid) {
             if (presentationScope == _cacheScope) {
               _rememberPurchaseContext(
@@ -1400,16 +1452,7 @@ class MySuperWallClient {
         'durationMs=${paywall.presentation.duration.inMilliseconds} '
         'curve=${paywall.presentation.curve.runtimeType}.',
       );
-      final wasAlreadyVisible = _activePreparedTriggerKey.value == triggerKey;
       _activePreparedTriggerKey.value = triggerKey;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (presentationScope == _cacheScope &&
-            !wasAlreadyVisible &&
-            _activePreparedTriggerKey.value == triggerKey &&
-            isHostMounted) {
-          _trackDisplayedEvent('paywall_shown', paywall, triggerKey);
-        }
-      });
     }
 
     return showPreparedPaywall();
@@ -1428,6 +1471,10 @@ class MySuperWallClient {
     ValueChanged<String?>? onOpenTerms,
     ValueChanged<String?>? onOpenPrivacy,
   }) {
+    if (_disposed || PaywallView.isShowing) {
+      if (disposeProvidedPreparedController) preparedController?.dispose();
+      return;
+    }
     final presentationScope = _cacheScope;
     PaywallView.show(
       context,
@@ -1495,51 +1542,58 @@ class MySuperWallClient {
     ValueChanged<String?>? onOpenTerms,
     ValueChanged<String?>? onOpenPrivacy,
   }) async {
-    if (!isHostMounted) {
+    if (_disposed || _hasActivePresentation) return false;
+    _presentationInProgress = true;
+    try {
+      if (!isHostMounted) {
+        _logger.i(
+          '[MySuperWall] Prepared presentation skipped for "$triggerKey": host not mounted.',
+        );
+        return false;
+      }
+
+      final preparedController = _preparedPaywallPool[triggerKey];
+      if (preparedController == null) {
+        _logger.i(
+          '[MySuperWall] Prepared presentation skipped for "$triggerKey": controller missing.',
+        );
+        return false;
+      }
+
+      if (!preparedController.hasCompletedInitialLoad) {
+        _logger.i(
+          '[MySuperWall] Prepared presentation skipped for "$triggerKey": controller not ready yet.',
+        );
+        return false;
+      }
+
+      var result = _freshMemoryResult(triggerKey);
+      result ??= await _loadFromDisk(triggerKey);
+      if (_disposed) return false;
+      if (result == null || !result.show || result.paywall == null) {
+        clearPreparedPaywallPool(triggerKeys: [triggerKey]);
+        return false;
+      }
+
       _logger.i(
-        '[MySuperWall] Prepared presentation skipped for "$triggerKey": host not mounted.',
+        '[MySuperWall] Presenting already-prepared paywall for trigger "$triggerKey".',
       );
-      return false;
-    }
-
-    final preparedController = _preparedPaywallPool[triggerKey];
-    if (preparedController == null) {
-      _logger.i(
-        '[MySuperWall] Prepared presentation skipped for "$triggerKey": controller missing.',
+      _incrementViewCount();
+      await _presentPreparedPaywall(
+        presentationContext,
+        triggerKey,
+        result,
+        onPurchase: onPurchase,
+        onRestore: onRestore,
+        onDismiss: onDismiss,
+        onOpenUrl: onOpenUrl,
+        onOpenTerms: onOpenTerms,
+        onOpenPrivacy: onOpenPrivacy,
       );
-      return false;
+      return true;
+    } finally {
+      _presentationInProgress = false;
     }
-
-    if (!preparedController.hasCompletedInitialLoad) {
-      _logger.i(
-        '[MySuperWall] Prepared presentation skipped for "$triggerKey": controller not ready yet.',
-      );
-      return false;
-    }
-
-    var result = _freshMemoryResult(triggerKey);
-    result ??= await _loadFromDisk(triggerKey);
-    if (result == null || !result.show || result.paywall == null) {
-      clearPreparedPaywallPool(triggerKeys: [triggerKey]);
-      return false;
-    }
-
-    _logger.i(
-      '[MySuperWall] Presenting already-prepared paywall for trigger "$triggerKey".',
-    );
-    _incrementViewCount();
-    await _presentPreparedPaywall(
-      presentationContext,
-      triggerKey,
-      result,
-      onPurchase: onPurchase,
-      onRestore: onRestore,
-      onDismiss: onDismiss,
-      onOpenUrl: onOpenUrl,
-      onOpenTerms: onOpenTerms,
-      onOpenPrivacy: onOpenPrivacy,
-    );
-    return true;
   }
 
   /// Prefetches a paywall for a given trigger and stores it in cache.
@@ -1560,7 +1614,7 @@ class MySuperWallClient {
         metadata: metadata,
       );
 
-      if (_cacheScope != scope) {
+      if (_disposed || _cacheScope != scope) {
         return const PaywallResult(
           show: false,
           paywall: null,
@@ -1580,7 +1634,7 @@ class MySuperWallClient {
 
       if (hasExplicitTargeting) return result;
       await _cacheResolvedPaywall(triggerKey, result);
-      if (_cacheScope != scope) {
+      if (_disposed || _cacheScope != scope) {
         return const PaywallResult(
           show: false,
           paywall: null,
@@ -1635,7 +1689,7 @@ class MySuperWallClient {
 
       final response = await _httpClient
           .post(
-            Uri.parse('${baseUrl}paywall/prefetch-active'),
+            Uri.parse('${sdkServiceUrl}paywall/prefetch-active'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode(body),
           )
@@ -1656,7 +1710,7 @@ class MySuperWallClient {
         );
       }
 
-      if (_cacheScope != scope) return {};
+      if (_disposed || _cacheScope != scope) return {};
       final items = payload['items'];
       if (items is! List) {
         throw MySuperWallException(
@@ -1697,7 +1751,7 @@ class MySuperWallClient {
         if (!hasExplicitTargeting) {
           await _cacheResolvedPaywall(triggerKey, paywallResult);
         }
-        if (_cacheScope != scope) return {};
+        if (_disposed || _cacheScope != scope) return {};
         results[triggerKey] = paywallResult;
       }
 
@@ -1714,7 +1768,7 @@ class MySuperWallClient {
           prefs,
         ).removeExcept(scope, results.keys.toSet());
       }
-      if (_cacheScope != scope) return {};
+      if (_disposed || _cacheScope != scope) return {};
       final removed = _paywallCache.keys
           .where((key) => !results.containsKey(key))
           .toList(growable: false);
@@ -1862,7 +1916,7 @@ class MySuperWallClient {
 
     final response = await _httpClient
         .post(
-          Uri.parse('${baseUrl}paywall'),
+          Uri.parse('${sdkServiceUrl}paywall'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode(body),
         )
@@ -1910,22 +1964,34 @@ class MySuperWallClient {
     ValueChanged<String?>? onOpenTerms,
     ValueChanged<String?>? onOpenPrivacy,
   }) async {
-    _flowGeneration++;
-    _followUps.cancel();
-    _followUpEvent = null;
-    _followUpPaywall = null;
-    _followUpOutcomePaywallId = null;
-    return _handleTrigger(
-      context,
-      triggerKey: triggerKey,
-      metadata: metadata,
-      onPurchase: onPurchase,
-      onRestore: onRestore,
-      onDismiss: onDismiss,
-      onOpenUrl: onOpenUrl,
-      onOpenTerms: onOpenTerms,
-      onOpenPrivacy: onOpenPrivacy,
-    );
+    if (_disposed || _hasActivePresentation) {
+      return PaywallResult(
+        show: false,
+        paywall: null,
+        reason: _disposed ? 'sdk_disposed' : 'presentation_in_progress',
+      );
+    }
+    _presentationInProgress = true;
+    try {
+      _flowGeneration++;
+      _followUps.cancel();
+      _followUpEvent = null;
+      _followUpPaywall = null;
+      _followUpOutcomePaywallId = null;
+      return await _handleTrigger(
+        context,
+        triggerKey: triggerKey,
+        metadata: metadata,
+        onPurchase: onPurchase,
+        onRestore: onRestore,
+        onDismiss: onDismiss,
+        onOpenUrl: onOpenUrl,
+        onOpenTerms: onOpenTerms,
+        onOpenPrivacy: onOpenPrivacy,
+      );
+    } finally {
+      _presentationInProgress = false;
+    }
   }
 
   Future<PaywallResult> _handleTrigger(
@@ -1943,6 +2009,7 @@ class MySuperWallClient {
     bool preventFollowUpRepeat = true,
   }) async {
     final scope = _cacheScope;
+    _updatePaywallState(triggerKey, MySuperWallPaywallState.loading);
     try {
       PaywallResult? result;
 
@@ -2060,7 +2127,7 @@ class MySuperWallClient {
         return result;
       }
 
-      if (_cacheScope != scope) {
+      if (_disposed || _cacheScope != scope) {
         return const PaywallResult(
           show: false,
           paywall: null,
@@ -2140,7 +2207,7 @@ class MySuperWallClient {
           }
         }
 
-        if (_cacheScope != scope) {
+        if (_disposed || _cacheScope != scope) {
           return const PaywallResult(
             show: false,
             paywall: null,
@@ -2168,7 +2235,7 @@ class MySuperWallClient {
           );
           final paywall = result.paywall!;
           final preparedRouteController = await _prepareRouteController(result);
-          if (_cacheScope != scope) {
+          if (_disposed || _cacheScope != scope) {
             preparedRouteController.dispose();
             return const PaywallResult(
               show: false,
@@ -2193,7 +2260,7 @@ class MySuperWallClient {
       } else {
         final paywall = result.paywall!;
         final preparedRouteController = await _prepareRouteController(result);
-        if (_cacheScope != scope) {
+        if (_disposed || _cacheScope != scope) {
           preparedRouteController.dispose();
           return const PaywallResult(
             show: false,
@@ -2218,6 +2285,7 @@ class MySuperWallClient {
 
       return result;
     } catch (e) {
+      _updatePaywallState(triggerKey, MySuperWallPaywallState.failed);
       if (e is MySuperWallException) {
         _logger.e('[MySuperWall] ${e.toString()}');
         rethrow;
@@ -2229,6 +2297,10 @@ class MySuperWallClient {
         code: 'trigger_execution_failed',
         details: {'triggerKey': triggerKey},
       );
+    } finally {
+      if (paywallStateFor(triggerKey) == MySuperWallPaywallState.loading) {
+        _updatePaywallState(triggerKey, MySuperWallPaywallState.idle);
+      }
     }
   }
 
@@ -2262,6 +2334,7 @@ class MySuperWallClient {
     final scope = _cacheScope;
     final seen = [...visited, paywall.id];
     bool valid() =>
+        !_disposed &&
         identical(_followUpPaywall, paywall) &&
         generation == _flowGeneration &&
         scope == _cacheScope &&
@@ -2570,7 +2643,7 @@ class MySuperWallClient {
       pendingEvent = body;
       final response = await _httpClient
           .post(
-            Uri.parse('${baseUrl}paywall/purchase'),
+            Uri.parse('${sdkServiceUrl}paywall/purchase'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode(body),
           )
@@ -2640,7 +2713,7 @@ class MySuperWallClient {
   }) {
     return PurchaseVerificationService(
       client: _httpClient,
-      baseUrl: baseUrl,
+      baseUrl: sdkServiceUrl,
       timeout: timeout,
     ).verify(appKey: appKey ?? '', productId: productId, proof: proof);
   }
@@ -2714,7 +2787,7 @@ class MySuperWallClient {
       pendingEvent = body;
       final response = await _httpClient
           .post(
-            Uri.parse('${baseUrl}paywall/dismiss'),
+            Uri.parse('${sdkServiceUrl}paywall/dismiss'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode(body),
           )
@@ -2738,6 +2811,27 @@ class MySuperWallClient {
   }
 
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _flowGeneration++;
+    _followUps.reset();
+    _followUpEvent = null;
+    _followUpPaywall = null;
+    _followUpOutcomePaywallId = null;
+    _automationActionHandler = null;
+    _eventQueue?.dispose();
+    _eventQueue = null;
+    if (identical(_instance, this)) {
+      dismiss();
+      setHostLoadingOverlayVisible(false);
+      _instance = null;
+    }
+    clearPreparedPaywallPool();
+    _paywallCache.clear();
+    _paywallCachedAt.clear();
+    _purchaseContexts.clear();
+    _pendingLifecycleTriggers.clear();
+    _paywallStates.dispose();
     _httpClient.close();
   }
 
