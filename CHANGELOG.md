@@ -1,3 +1,9 @@
+## 1.2.1 - 2026-10-18
+
+- Keep one prepared paywall by default (`configurePreparedPaywallPool` previously defaulted to 0), so `MySuperWallHost` actually keeps the preferred trigger warm and `handleTrigger` no longer rebuilds the WebView on every presentation. Pass `maxCount: 0` to opt out.
+- Add `initialize(locale:)` so the paywall language is set before anything is cached.
+- Document the startup preparation step and that per-presentation `setLocale` / `setProductPrices` calls with new values discard the prepared paywall.
+
 ## 1.2.0
 
 - Keep prepared WebViews mounted so the first opening can animate without a fixed paint timeout.

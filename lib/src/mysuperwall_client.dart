@@ -121,7 +121,10 @@ class MySuperWallClient {
   LocalRuleEngine get localRuleEngine => _localRuleEngine;
   OfflineEventQueue? get eventQueue => _eventQueue;
   final List<String> _pendingLifecycleTriggers = [];
-  int _maxPreparedPaywalls = 0;
+  // One prepared paywall by default, so MySuperWallHost keeps the preferred
+  // trigger warm and handleTrigger presents it without rebuilding a WebView.
+  // configurePreparedPaywallPool(maxCount: 0) opts out.
+  int _maxPreparedPaywalls = 1;
   static final ValueNotifier<int> _preparedPoolVersion = ValueNotifier<int>(0);
   static final ValueNotifier<String?> _activePreparedTriggerKey =
       ValueNotifier<String?>(null);
@@ -588,6 +591,7 @@ class MySuperWallClient {
     Duration requestTimeout = const Duration(seconds: 8),
     bool failOpenOnNetworkError = true,
     MySuperWallLogLevel logLevel = MySuperWallLogLevel.warning,
+    String? locale,
   }) async {
     setLogLevel(logLevel);
     try {
@@ -608,6 +612,12 @@ class MySuperWallClient {
         failOpenOnNetworkError: failOpenOnNetworkError,
       );
       client._prefs = prefs;
+      // Set the paywall language before anything is cached: changing it later
+      // with setLocale clears the manifest and every prepared paywall.
+      final initialLocale = locale?.trim().replaceAll('_', '-').toLowerCase();
+      if (initialLocale != null && initialLocale.isNotEmpty) {
+        client._locale = initialLocale;
+      }
       client._manifestService = ManifestService(
         preferences: prefs,
         httpClient: client._httpClient,

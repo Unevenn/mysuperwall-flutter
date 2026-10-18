@@ -41,7 +41,7 @@ Design in MySuperWall. Publish remotely. Show the right paywall in your app — 
 
 ```yaml
 dependencies:
-  mysuperwall_sdk: ^1.2.0
+  mysuperwall_sdk: ^1.2.1
 ```
 
 Requires **Flutter 3.35+ / Dart 3.9+**. Supports **iOS and Android**.
@@ -56,10 +56,13 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await MySuperWallClient.initialize(
     appKey: 'YOUR_APP_KEY', // Dashboard → your app → Settings
+    locale: 'en', // your app's language, set once here
   );
   runApp(const MyApp());
 }
 ```
+
+Pass the app language to `initialize`, not before each presentation: a later `setLocale` with a different value (for example `tr` while the device default is `tr-tr`) clears the cached manifest and the prepared paywall.
 
 Add the host to your existing `MaterialApp` or `GetMaterialApp` builder. Preserve any builder your app already uses.
 
@@ -69,7 +72,24 @@ builder: (context, child) => MySuperWallHost(
 ),
 ```
 
-### 3. Present
+### 3. Prepare once at startup
+
+When your store prices are available (for example after RevenueCat returns the current offering), push them once and warm the paywall you show most often. `MySuperWallHost` keeps one prepared paywall by default, so the next `handleTrigger` for that trigger opens instantly.
+
+```dart
+final client = MySuperWallClient.instance;
+await client.setProductPrices(localizedPrices); // from your billing provider
+await client.setPreparedPaywallPreferences(
+  preferredTriggerKeys: const ['premium'],
+  warmPool: false,
+);
+await client.prefetchAllActivePaywalls();
+await client.warmPreparedPaywalls();
+```
+
+Do this at startup and again only when prices or the language change. Calling `setProductPrices` or `setLocale` with new values before every presentation discards the prepared paywall and rebuilds it, which makes every opening slow.
+
+### 4. Present
 
 ```dart
 final result = await MySuperWallClient.instance.handleTrigger(
@@ -107,7 +127,7 @@ await MySuperWallClient.instance.trackPurchaseSuccess(
 <details>
 <summary><strong>Localized product prices &amp; introductory offers</strong></summary>
 
-Read localized prices from your store integration and pass them by product ID before presentation. The strings below are illustrative; use actual store values in production.
+Read localized prices from your store integration and pass them by product ID once they are loaded (see *Prepare once at startup*), not before every presentation. The strings below are illustrative; use actual store values in production.
 
 ```dart
 await MySuperWallClient.instance.setProductPrices({
