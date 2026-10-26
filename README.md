@@ -41,7 +41,7 @@ Design in MySuperWall. Publish remotely. Show the right paywall in your app — 
 
 ```yaml
 dependencies:
-  mysuperwall_sdk: ^1.2.1
+  mysuperwall_sdk: ^1.3.0
 ```
 
 Requires **Flutter 3.35+ / Dart 3.9+**. Supports **iOS and Android**.
@@ -91,16 +91,36 @@ Do this at startup and again only when prices or the language change. Calling `s
 
 ### 4. Present
 
+Purchase and restore callbacks do **not** automatically start a loading indicator. Mount `MySuperWallHost` in your existing app builder and keep this helper in your existing controller/service. Show loading before product lookup or billing, await completion, and always clear it in `finally`. The shared guard prevents repeated purchase/restore taps.
+
+```dart
+// Keep this helper and billing handlers in your existing controller/service.
+// Mount MySuperWallHost in the app builder before presenting paywalls.
+bool isStoreActionInProgress = false;
+Future<void> runWithPurchaseLoading(Future<void> Function() action) async {
+  if (isStoreActionInProgress) return;
+  isStoreActionInProgress = true;
+  MySuperWallClient.setHostLoadingOverlayVisible(true);
+  try {
+    await action();
+  } finally {
+    MySuperWallClient.setHostLoadingOverlayVisible(false);
+    isStoreActionInProgress = false;
+  }
+}
+```
+
+`purchaseProduct` and `restorePurchases` below mean your existing asynchronous billing methods; they are not SDK methods. They must await billing, handle cancellation/errors, report confirmed outcomes, and update entitlements. Apply the same wrappers to `presentPreparedPaywallIfAvailable` callbacks when using prepared presentation. If you do not mount `MySuperWallHost`, use your app's existing loading overlay above the paywall.
+
 ```dart
 final result = await MySuperWallClient.instance.handleTrigger(
   context,
   triggerKey: 'onboarding_finish',
   onPurchase: (productId) async {
-    // Connect your real purchase handler here.
-    // Report success only after your billing provider confirms completion.
+    await runWithPurchaseLoading(() => purchaseProduct(productId));
   },
-  onRestore: () {
-    // Restore purchases through your existing billing integration.
+  onRestore: () async {
+    await runWithPurchaseLoading(restorePurchases);
   },
 );
 
@@ -282,6 +302,35 @@ RevenueCat totals for the same transactions. Backend contract:
 </details>
 
 ---
+
+### Push notifications (optional, 1.3.0+)
+
+Connect your Firebase project under **Integrations → Push notifications**, then create notifications under **Notifications** (for example "1 hour after a paywall is closed", opening a discount paywall). The SDK has no Firebase dependency: your app reads the FCM token and hands it over.
+
+```dart
+final messaging = FirebaseMessaging.instance;
+await messaging.requestPermission();
+final token = await messaging.getToken();
+if (token != null) await client.setPushToken(token);
+messaging.onTokenRefresh.listen(client.setPushToken);
+
+// Tapping a notification shows the paywall of its trigger.
+Future<void> openFrom(RemoteMessage message) async {
+  final key = await client.trackNotificationOpened(message.data);
+  if (key == null || !context.mounted) return;
+  await client.prepareTrigger(key); // its paywall is usually not prepared yet
+  if (context.mounted) await client.handleTrigger(context, triggerKey: key);
+}
+FirebaseMessaging.onMessageOpenedApp.listen(openFrom);
+final initial = await messaging.getInitialMessage();
+if (initial != null) await openFrom(initial);
+```
+
+- The token is registered for the current user and language and registered again by itself after `setUserId` / `setLocale` (at most once a day otherwise). The notification text is chosen from that language.
+- `handleNotificationOpened(context, data, {...})` does `trackNotificationOpened` plus `handleTrigger` in one call. Use the two-step form when you present paywalls with your own purchase callbacks.
+- Wait for your startup work (`setProductData`, `setLocale`, warming) to finish before presenting a tapped notification's paywall, and call `prepareTrigger` first, otherwise the paywall can open as a blank page.
+- Call `clearPushToken()` to stop notifications for the device. People who just bought are skipped on the server.
+- Android: keep `WAKE_LOCK` in your manifest and request `POST_NOTIFICATIONS`; notifications show only while the app is in the background. iOS: enable the Push Notifications capability and upload your APNs key to Firebase.
 
 ## Build something worth subscribing to.
 

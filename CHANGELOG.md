@@ -1,3 +1,8 @@
+## 1.3.0 - 2026-10-26
+
+- Add optional push notifications: `setPushToken` / `clearPushToken` register the app's FCM token for the current user and language (no Firebase dependency in the SDK), `trackNotificationOpened` reports a tap and returns the trigger to open, and `handleNotificationOpened` also presents it.
+- Add `prepareTrigger(triggerKey)`: loads a trigger's paywall and keeps it prepared, so one outside your usual prepared set (for example the one a notification points at) opens painted instead of as a blank page.
+
 ## 1.2.1 - 2026-10-18
 
 - Keep one prepared paywall by default (`configurePreparedPaywallPool` previously defaulted to 0), so `MySuperWallHost` actually keeps the preferred trigger warm and `handleTrigger` no longer rebuilds the WebView on every presentation. Pass `maxCount: 0` to opt out.
@@ -14,11 +19,6 @@
 - Preserve localized store price cache invalidation from 1.1.6.
 
 # Changelog
-
-## 1.1.6 - 2026-10-15
-
-- Invalidate rendered manifest, disk paywall cache and prepared WebViews when store product data changes; refresh the manifest with the current localized prices.
-- Apply the same invalidation to legacy product-loading methods and snapshot product payloads against external mutation.
 
 ## 1.1.5 - 2026-10-15
 

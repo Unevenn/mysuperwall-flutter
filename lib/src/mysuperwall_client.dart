@@ -367,6 +367,21 @@ class MySuperWallClient {
     }
   }
 
+  /// Loads the paywall for [triggerKey] and keeps it prepared, so presenting it
+  /// right after is instant instead of showing a blank page while its web view
+  /// loads. Use it before presenting a trigger that is not part of your usual
+  /// prepared set, for example the one a push notification points at. Returns
+  /// false when the trigger has no paywall to show.
+  Future<bool> prepareTrigger(String triggerKey) async {
+    final result = await prefetchPaywall(
+      triggerKey: triggerKey,
+      logNoPaywallResult: false,
+    );
+    if (!result.show) return false;
+    await warmPreparedPaywalls(preferredTriggerKeys: [triggerKey]);
+    return true;
+  }
+
   void clearPreparedPaywallPool({List<String>? triggerKeys}) {
     if (triggerKeys == null || triggerKeys.isEmpty) {
       for (final controller in _preparedPaywallPool.values) {
@@ -646,6 +661,9 @@ class MySuperWallClient {
       // Compute which lifecycle triggers apply this session
       await client._computeLifecycleTriggers(prefs);
 
+      // A token saved by an earlier session is refreshed at most once a day.
+      unawaited(client._syncPushToken());
+
       _instance?.dispose();
       _instance = client;
       return client;
@@ -903,6 +921,7 @@ class MySuperWallClient {
     _userId = userId.trim();
     _subscriptionPremium = false;
     _clearIdentityState();
+    unawaited(_syncPushToken());
   }
 
   /// Set the locale explicitly, rather than relying on the backend default
@@ -915,6 +934,7 @@ class MySuperWallClient {
 
     _locale = normalizedLocale;
     _clearIdentityState();
+    unawaited(_syncPushToken());
   }
 
   /// Country is a region code such as TR; it is independent of the paywall language.
@@ -2817,6 +2837,187 @@ class MySuperWallClient {
     } catch (e) {
       if (pendingEvent != null) _eventQueue?.enqueue(pendingEvent);
       _logger.e('[MySuperWall] Dismiss tracking error: $e');
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Push notifications (optional)
+  //
+  // The SDK does not depend on Firebase. Your app reads the FCM token with
+  // firebase_messaging and hands it over with [setPushToken]; MySuperWall then
+  // sends notifications (for example after a paywall is closed) through the
+  // Firebase project connected in the dashboard.
+  // ---------------------------------------------------------------------
+
+  static const _pushTokenKey = 'mysuperwall_push_token';
+  static const _pushSyncKey = 'mysuperwall_push_sync';
+  String? _pushToken;
+
+  /// Registers this device's FCM token so notifications can reach it.
+  ///
+  /// Call it once the user allowed notifications, and again from
+  /// `FirebaseMessaging.instance.onTokenRefresh`. The token is registered for
+  /// the current user and language and re-registered automatically when
+  /// [setUserId] or [setLocale] change them.
+  Future<void> setPushToken(String token) async {
+    final value = token.trim();
+    if (value.isEmpty) {
+      throw const MySuperWallException('Push token cannot be empty');
+    }
+    _pushToken = value;
+    try {
+      await _prefs?.setString(_pushTokenKey, value);
+    } catch (_) {}
+    await _syncPushToken(force: true);
+  }
+
+  /// Stops notifications for this device, for example when the user turns
+  /// them off in your app or logs out.
+  Future<void> clearPushToken() async {
+    final token = _pushToken ?? _prefs?.getString(_pushTokenKey);
+    _pushToken = null;
+    try {
+      await _prefs?.remove(_pushTokenKey);
+      await _prefs?.remove(_pushSyncKey);
+    } catch (_) {}
+    if (token == null || _disposed) return;
+    try {
+      final appInfo = await PackageInfo.fromPlatform();
+      await _httpClient
+          .post(
+            Uri.parse('${sdkServiceUrl}paywall/push-token/remove'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              if (appKey != null && appKey!.isNotEmpty) 'appKey': appKey,
+              if (Platform.isIOS) 'bundleId': appInfo.packageName,
+              if (Platform.isAndroid) 'packageName': appInfo.packageName,
+              'token': token,
+            }),
+          )
+          .timeout(timeout);
+    } catch (e) {
+      _logger.e('[MySuperWall] Push token removal error: $e');
+    }
+  }
+
+  Future<void> _syncPushToken({bool force = false}) async {
+    if (_disposed) return;
+    final token = _pushToken ?? _prefs?.getString(_pushTokenKey);
+    final userId = _userId;
+    if (token == null || userId == null) return;
+    _pushToken = token;
+    try {
+      final appInfo = await PackageInfo.fromPlatform();
+      final offset = DateTime.now().timeZoneOffset.inMinutes;
+      final signature = jsonEncode([token, userId, _locale, appInfo.version, offset]);
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (!force) {
+        final last = _prefs?.getString(_pushSyncKey);
+        if (last != null) {
+          final saved = jsonDecode(last) as Map<String, dynamic>;
+          if (saved['s'] == signature && now - (saved['t'] as int) < 86400000) return;
+        }
+      }
+      final response = await _httpClient
+          .post(
+            Uri.parse('${sdkServiceUrl}paywall/push-token'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              if (appKey != null && appKey!.isNotEmpty) 'appKey': appKey,
+              if (Platform.isIOS) 'bundleId': appInfo.packageName,
+              if (Platform.isAndroid) 'packageName': appInfo.packageName,
+              'userId': userId,
+              'token': token,
+              'platform': Platform.isIOS ? 'ios' : 'android',
+              if (_locale != null) 'locale': _locale,
+              'utcOffsetMinutes': offset,
+              'appVersion': appInfo.version,
+            }),
+          )
+          .timeout(timeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        await _prefs?.setString(_pushSyncKey, jsonEncode({'s': signature, 't': now}));
+      }
+    } catch (e) {
+      _logger.e('[MySuperWall] Push token registration error: $e');
+    }
+  }
+
+  /// True when a push message was sent by MySuperWall. Use it to tell these
+  /// messages apart from your own in `onMessageOpenedApp`.
+  static bool isMySuperWallNotification(Map<String, dynamic> data) =>
+      data['mysuperwall'] == '1';
+
+  /// Reports that the user tapped a MySuperWall notification and returns the
+  /// trigger key chosen for it in the dashboard, or null when the message did
+  /// not come from MySuperWall (or names no trigger).
+  ///
+  /// Use it when your app presents paywalls itself (for example with its own
+  /// purchase callbacks) and only needs to know which trigger to run.
+  Future<String?> trackNotificationOpened(Map<String, dynamic> data) async {
+    if (_disposed || !isMySuperWallNotification(data)) return null;
+    unawaited(_reportNotificationOpened(data['jobId']?.toString()));
+    final triggerKey = data['triggerKey']?.toString() ?? '';
+    return triggerKey.isEmpty ? null : triggerKey;
+  }
+
+  /// Call with `RemoteMessage.data` when the user taps a notification
+  /// (`FirebaseMessaging.onMessageOpenedApp` and `getInitialMessage()`).
+  ///
+  /// Reports the open for analytics and runs the trigger chosen for the
+  /// notification in the dashboard, which shows its paywall. Returns false when
+  /// the message did not come from MySuperWall.
+  Future<bool> handleNotificationOpened(
+    BuildContext context,
+    Map<String, dynamic> data, {
+    Map<String, dynamic>? metadata,
+    Function(String productId)? onPurchase,
+    VoidCallback? onRestore,
+    VoidCallback? onDismiss,
+    ValueChanged<String>? onOpenUrl,
+    ValueChanged<String?>? onOpenTerms,
+    ValueChanged<String?>? onOpenPrivacy,
+  }) async {
+    if (_disposed || !isMySuperWallNotification(data)) return false;
+    final triggerKey = await trackNotificationOpened(data);
+    if (triggerKey != null && context.mounted) {
+      await handleTrigger(
+        context,
+        triggerKey: triggerKey,
+        metadata: {...?metadata, 'source': 'notification'},
+        onPurchase: onPurchase,
+        onRestore: onRestore,
+        onDismiss: onDismiss,
+        onOpenUrl: onOpenUrl,
+        onOpenTerms: onOpenTerms,
+        onOpenPrivacy: onOpenPrivacy,
+      );
+    }
+    return true;
+  }
+
+  Future<void> _reportNotificationOpened(String? jobId) async {
+    final userId = _userId;
+    if (jobId == null || jobId.isEmpty || userId == null) return;
+    try {
+      final appInfo = await PackageInfo.fromPlatform();
+      await _httpClient
+          .post(
+            Uri.parse('${sdkServiceUrl}paywall/notification-opened'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              if (appKey != null && appKey!.isNotEmpty) 'appKey': appKey,
+              if (Platform.isIOS) 'bundleId': appInfo.packageName,
+              if (Platform.isAndroid) 'packageName': appInfo.packageName,
+              'userId': userId,
+              'jobId': jobId,
+              'platform': Platform.isIOS ? 'ios' : 'android',
+              'appVersion': appInfo.version,
+            }),
+          )
+          .timeout(timeout);
+    } catch (e) {
+      _logger.e('[MySuperWall] Notification open report error: $e');
     }
   }
 
