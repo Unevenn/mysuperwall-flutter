@@ -149,18 +149,22 @@ class _MySuperWallHostState extends State<MySuperWallHost>
         return Stack(
           fit: StackFit.expand,
           children: [
-            // Keep native WebViews mounted before their first presentation.
-            // Offstage or zero opacity would prevent useful pre-painting.
+            // Pre-paint once, then detach hidden native views to stop GPU work.
             for (final entry
                 in MySuperWallClient
                     .instance
                     .preparedPaywallControllers
                     .entries)
               if (entry.key != activeEntry?.key)
-                _PreparedLayer(
+                ValueListenableBuilder<bool>(
                   key: ObjectKey(entry.value),
-                  controller: entry.value,
-                  isActive: false,
+                  valueListenable: entry.value.isLoading,
+                  builder: (context, loading, _) => !loading
+                      ? const SizedBox.shrink()
+                      : _PreparedLayer(
+                          controller: entry.value,
+                          isActive: false,
+                        ),
                 ),
             KeyedSubtree(
               key: const ValueKey('mysuperwall_host_content'),

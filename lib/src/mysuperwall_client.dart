@@ -44,16 +44,6 @@ class MySuperWallClient {
   static const String _preparedExcludedTriggersCacheKey =
       'mysuperwall_prepared_excluded_triggers';
   static const int _paywallCacheSchemaVersion = 3;
-  static const Set<String> _terminalNoPaywallReasons = {
-    'holdout',
-    'app_not_found',
-    'trigger_not_found',
-    'paywall_not_assigned',
-    'paywall_inactive',
-    'missing_trigger_key',
-    'missing_app_identifier',
-  };
-
   final String? appKey; // Optional if package identifier is used
   String? _userId; // Centralized user ID
   String? _locale = Platform.localeName.replaceAll('_', '-').toLowerCase();
@@ -98,7 +88,6 @@ class MySuperWallClient {
   final http.Client _httpClient;
   final Duration timeout;
   final bool failOpenOnNetworkError;
-  final Map<String, DateTime> _paywallCachedAt = {};
   final Map<String, dynamic> _productData = {};
   int _productDataRevision = 0;
   final Map<String, PaywallResult> _paywallCache = {};
@@ -224,6 +213,10 @@ class MySuperWallClient {
     }
 
     if (_hostMountCount == 0) {
+      final activeKey = _activePreparedTriggerKey.value;
+      if (activeKey != null) {
+        _instance?._preparedPaywallPool[activeKey]?.deactivate();
+      }
       _activePreparedTriggerKey.value = null;
     }
   }
@@ -357,9 +350,9 @@ class MySuperWallClient {
         }
       }
 
-      final result =
-          _freshMemoryResult(triggerKey) ?? await _loadFromDisk(triggerKey);
-      if (result == null || !result.show || result.paywall == null) {
+      if (_excludedPreparedTriggerKeys.contains(triggerKey)) continue;
+      final result = await _refreshTriggerDecision(triggerKey: triggerKey);
+      if (!result.show || result.paywall == null) {
         continue;
       }
 
@@ -383,7 +376,12 @@ class MySuperWallClient {
   }
 
   void clearPreparedPaywallPool({List<String>? triggerKeys}) {
-    if (triggerKeys == null || triggerKeys.isEmpty) {
+    if (triggerKeys != null && triggerKeys.isEmpty) return;
+    final activeKey = _activePreparedTriggerKey.value;
+    if (activeKey != null && (triggerKeys == null || triggerKeys.contains(activeKey))) {
+      dismissPreparedPaywall();
+    }
+    if (triggerKeys == null) {
       for (final controller in _preparedPaywallPool.values) {
         controller.dispose();
       }
@@ -400,7 +398,6 @@ class MySuperWallClient {
 
   Future<void> clearCachedPaywalls({bool clearPreparedPaywalls = true}) async {
     _paywallCache.clear();
-    _paywallCachedAt.clear();
     _preparedPriorityByTrigger.clear();
 
     if (clearPreparedPaywalls) {
@@ -654,7 +651,7 @@ class MySuperWallClient {
       await client._validateConfiguration();
 
       // Non-blocking background manifest sync with ETag / 304 validation
-      unawaited(client._syncManifestInBackground());
+      unawaited(client._syncManifestInBackground().then<void>((_) {}));
 
       // Manage internal metrics
       await client._updateInternalMetrics(prefs);
@@ -742,11 +739,11 @@ class MySuperWallClient {
     );
   }
 
-  Future<void> _syncManifestInBackground() async {
+  Future<bool> _syncManifestInBackground({bool requireFresh = false}) async {
     try {
       final appInfo = await PackageInfo.fromPlatform();
-      if (_disposed) return;
-      await _manifestService?.fetchManifest(
+      if (_disposed) return false;
+      final manifest = await _manifestService?.fetchManifest(
         baseUrl: sdkServiceUrl,
         scope: _cacheScope,
         appKey: appKey,
@@ -757,9 +754,12 @@ class MySuperWallClient {
         lang: _locale,
         substitutionData: _productData,
         timeout: timeout,
+        allowCachedOnError: !requireFresh,
       );
+      return !_disposed && manifest != null;
     } catch (e) {
       _logger.d('[MySuperWall] Background manifest sync error: $e');
+      return false;
     }
   }
 
@@ -960,21 +960,10 @@ class MySuperWallClient {
     _followUpPaywall = null;
     _followUpOutcomePaywallId = null;
     _manifestService?.loadFromDisk(_cacheScope);
-    unawaited(_syncManifestInBackground());
+    unawaited(_syncManifestInBackground().then<void>((_) {}));
     _paywallCache.clear();
-    _paywallCachedAt.clear();
     _purchaseContexts.clear();
     clearPreparedPaywallPool();
-  }
-
-  PaywallResult? _freshMemoryResult(String key) {
-    final savedAt = _paywallCachedAt[key];
-    if (savedAt == null ||
-        DateTime.now().difference(savedAt) >
-            PaywallCacheService.freshLifetime) {
-      return null;
-    }
-    return _paywallCache[key];
   }
 
   bool _isTransientFailure(Object error) {
@@ -1216,15 +1205,6 @@ class MySuperWallClient {
     );
   }
 
-  bool _isTerminalNoPaywallResult(PaywallResult result) {
-    if (result.show || result.paywall != null) {
-      return false;
-    }
-
-    final reason = result.reason?.trim();
-    return reason != null && _terminalNoPaywallReasons.contains(reason);
-  }
-
   Future<void> _cacheResolvedPaywall(
     String triggerKey,
     PaywallResult result,
@@ -1236,6 +1216,12 @@ class MySuperWallClient {
     final scope = _cacheScope;
     await _stashAssetsAsBase64(result.paywall!);
     if (_disposed || _cacheScope != scope) return;
+    final prepared = _preparedPaywallPool[triggerKey];
+    if (prepared != null &&
+        jsonEncode(prepared.paywall.toJson()) !=
+            jsonEncode(result.paywall!.toJson())) {
+      clearPreparedPaywallPool(triggerKeys: [triggerKey]);
+    }
     final productDetails = <String>[];
     for (final productId in result.paywall!.productIds) {
       final data = _productData[productId];
@@ -1582,6 +1568,9 @@ class MySuperWallClient {
         return false;
       }
 
+      final result = await _refreshTriggerDecision(triggerKey: triggerKey);
+      if (!result.show || result.paywall == null || _disposed) return false;
+
       final preparedController = _preparedPaywallPool[triggerKey];
       if (preparedController == null) {
         _logger.i(
@@ -1594,14 +1583,6 @@ class MySuperWallClient {
         _logger.i(
           '[MySuperWall] Prepared presentation skipped for "$triggerKey": controller not ready yet.',
         );
-        return false;
-      }
-
-      var result = _freshMemoryResult(triggerKey);
-      result ??= await _loadFromDisk(triggerKey);
-      if (_disposed) return false;
-      if (result == null || !result.show || result.paywall == null) {
-        clearPreparedPaywallPool(triggerKeys: [triggerKey]);
         return false;
       }
 
@@ -1674,19 +1655,6 @@ class MySuperWallClient {
       return result;
     } catch (e) {
       _logger.w('[MySuperWall] Preload failed for $triggerKey: $e');
-      if (!_isTransientFailure(e) ||
-          _cacheScope != scope ||
-          hasExplicitTargeting) {
-        rethrow;
-      }
-      // Stale cache is permitted only for transient failures, for at most 24 hours.
-      try {
-        final cached = await _loadFromDisk(triggerKey, allowStale: true);
-        if (cached != null) {
-          _paywallCache[triggerKey] = cached;
-          return cached;
-        }
-      } catch (_) {}
       rethrow;
     }
   }
@@ -1804,21 +1772,10 @@ class MySuperWallClient {
           .toList(growable: false);
       for (final key in removed) {
         _paywallCache.remove(key);
-        _paywallCachedAt.remove(key);
       }
       clearPreparedPaywallPool(triggerKeys: removed);
       return results;
     } catch (error) {
-      if (!_isTransientFailure(error) ||
-          _cacheScope != scope ||
-          hasExplicitTargeting) {
-        rethrow;
-      }
-      final prefs = _prefs;
-      final cached = prefs == null
-          ? <String, PaywallResult>{}
-          : PaywallCacheService(prefs).readAll(scope, allowStale: true);
-      if (cached.isNotEmpty || failOpenOnNetworkError) return cached;
       rethrow;
     }
   }
@@ -1889,7 +1846,6 @@ class MySuperWallClient {
   Future<void> _saveToDisk(String key, PaywallResult result) async {
     final prefs = _prefs;
     if (prefs == null) return;
-    _paywallCachedAt[key] = DateTime.now();
     try {
       await PaywallCacheService(prefs).save(_cacheScope, key, result);
     } catch (error) {
@@ -1897,23 +1853,43 @@ class MySuperWallClient {
     }
   }
 
-  Future<PaywallResult?> _loadFromDisk(
-    String key, {
-    bool allowStale = false,
+  /// Cached HTML is reusable; permission to show must come from the server.
+  /// A network failure must never resurrect a remotely disabled paywall.
+  Future<PaywallResult> _refreshTriggerDecision({
+    required String triggerKey,
+    Map<String, dynamic>? metadata,
   }) async {
-    final prefs = _prefs;
-    if (prefs == null) return null;
-    try {
-      final cached = PaywallCacheService(
-        prefs,
-      ).read(_cacheScope, key, allowStale: allowStale);
-      if (cached == null) return null;
-      _paywallCachedAt[key] = cached.savedAt;
-      return cached.result;
-    } catch (error) {
-      _logger.w('[MySuperWall] Disk load failed: $error');
-      return null;
+    final scope = _cacheScope;
+    final result = await _fetchPaywallData(
+      triggerKey: triggerKey,
+      metadata: metadata,
+    );
+    if (_disposed || scope != _cacheScope) {
+      return const PaywallResult(
+        show: false,
+        paywall: null,
+        reason: 'identity_changed',
+      );
     }
+    if (!result.show || result.paywall == null) {
+      clearPreparedPaywallPool(triggerKeys: [triggerKey]);
+      _paywallCache[triggerKey] = result;
+      await _saveToDisk(triggerKey, result);
+      return result;
+    }
+    if (metadata == null || metadata.isEmpty) {
+      await _cacheResolvedPaywall(triggerKey, result);
+    } else {
+      clearPreparedPaywallPool(triggerKeys: [triggerKey]);
+    }
+    if (_disposed || scope != _cacheScope) {
+      return const PaywallResult(
+        show: false,
+        paywall: null,
+        reason: 'identity_changed',
+      );
+    }
+    return result;
   }
 
   /// Internal method to fetch paywall data from backend
@@ -2041,116 +2017,13 @@ class MySuperWallClient {
     final scope = _cacheScope;
     _updatePaywallState(triggerKey, MySuperWallPaywallState.loading);
     try {
-      PaywallResult? result;
-
-      // 0. ZERO LATENCY (0ms): In-memory client-side rule evaluation from offline manifest
-      final manifest = _manifestService?.manifest;
-      final manifestTrigger = manifest?.findTrigger(triggerKey);
-      if (manifest != null && manifestTrigger != null) {
-        final appInfo = await PackageInfo.fromPlatform();
-        final systemMetadata = await _getSystemMetadata();
-        final evalContext = <String, dynamic>{
-          'platform': Platform.isIOS ? 'ios' : 'android',
-          'appVersion': appInfo.version,
-          'country': _country ?? _deviceCountry,
-          'metadata': {...?metadata, ...systemMetadata},
-          'userAttributes': {...?metadata, ...systemMetadata},
-        };
-
-        final resolution = _localRuleEngine.resolveTrigger(
-          trigger: manifestTrigger,
-          userId: _userId,
-          context: evalContext,
-        );
-
-        if (resolution.isHoldout) {
-          result = const PaywallResult(
-            show: false,
-            paywall: null,
-            reason: 'holdout',
-          );
-          _eventQueue?.enqueue({
-            'type': 'trigger_fired',
-            'triggerKey': triggerKey,
-            'isHoldout': true,
-            'ruleName': resolution.matchedRuleName,
-            'userId': _userId,
-            'metadata': metadata,
-          });
-          unawaited(_flushEventQueue());
-          return result;
-        }
-
-        if (resolution.show && resolution.paywallId != null) {
-          final manifestPaywall = manifest.paywalls[resolution.paywallId];
-          if (manifestPaywall != null) {
-            result = manifestPaywall.toPaywallResult(
-              triggerKey: triggerKey,
-              appKey: appKey ?? appInfo.packageName,
-              abVariant: resolution.abVariant,
-              experimentContext: resolution.experimentContext,
-            );
-            _paywallCache[triggerKey] = result;
-            _eventQueue?.enqueue({
-              'type': 'trigger_fired',
-              'triggerKey': triggerKey,
-              'paywallId': manifestPaywall.id,
-              'paywallName': manifestPaywall.name,
-              'abVariant': resolution.abVariant,
-              if (result.paywall?.experimentContext != null)
-                'experimentContext': result.paywall?.experimentContext,
-              'ruleName': resolution.matchedRuleName,
-              'userId': _userId,
-              'metadata': metadata,
-            });
-            unawaited(_flushEventQueue());
-          }
-        }
-      }
-
-      // 1. Try Memory Cache
-      if (result == null) {
-        result = metadata == null || metadata.isEmpty
-            ? _freshMemoryResult(triggerKey)
-            : null;
-      }
-
-      if (result != null && _isTerminalNoPaywallResult(result)) {
-        return result;
-      }
-
-      // 2. Try Disk Cache
-      if (result == null && (metadata == null || metadata.isEmpty)) {
-        result = await _loadFromDisk(triggerKey);
-        if (result != null) {
-          _paywallCache[triggerKey] = result;
-        }
-      }
-
-      // 3. Logic for Background Update vs Fresh Fetch
-      if (result != null) {
-        // Cache found. Present it directly without triggering another
-        // background prefetch on every paywall open.
-      } else {
-        // No cache found (likely first run). Must wait for fresh data.
-        try {
-          result = await prefetchPaywall(
-            triggerKey: triggerKey,
-            metadata: metadata,
-            logNoPaywallResult: false,
-          );
-        } catch (e) {
-          _logger.w('[MySuperWall] Fresh fetch failed for $triggerKey: $e');
-          if (failOpenOnNetworkError && _isTransientFailure(e)) {
-            return const PaywallResult(
-              show: false,
-              paywall: null,
-              reason: 'network_unavailable',
-            );
-          }
-          rethrow;
-        }
-      }
+      final manifestTrigger = _manifestService?.manifest?.findTrigger(
+        triggerKey,
+      );
+      final result = await _refreshTriggerDecision(
+        triggerKey: triggerKey,
+        metadata: metadata,
+      );
 
       if (!result.show || result.paywall == null) {
         _logNoPaywallResult(triggerKey, result, phase: 'handleTrigger');
@@ -2456,10 +2329,11 @@ class MySuperWallClient {
           } else {
             await Future<void>.delayed(const Duration(milliseconds: 350));
             if (!valid()) return;
-            if (_manifestService?.manifest == null) {
-              await _syncManifestInBackground();
-            }
+            if (!await _syncManifestInBackground(requireFresh: true)) return;
             if (!valid()) return;
+            if (_manifestService?.manifest?.findTrigger(paywall.triggerKey) ==
+                null)
+              return;
             final resolvedLegacy =
                 legacy ??
                 _manifestService?.manifest
@@ -3039,7 +2913,6 @@ class MySuperWallClient {
     }
     clearPreparedPaywallPool();
     _paywallCache.clear();
-    _paywallCachedAt.clear();
     _purchaseContexts.clear();
     _pendingLifecycleTriggers.clear();
     _paywallStates.dispose();

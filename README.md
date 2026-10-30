@@ -1,3 +1,5 @@
+> **1.3.1 delivery behavior (2026-10-30):** The Flutter SDK validates delivery with the server before every presentation, including prepared views. Disabled triggers/paywalls and holdout decisions must not open a native/default fallback. Cached content is not shown on network failure. Hidden prepared views detach after loading; animations and media pause while hidden/backgrounded. Keep `MySuperWallHost`. Prewarming avoids HTML loading work, but a network decision is still required. Dashboard changes take effect on the next delivery request, not by closing an already-open screen.
+
 [![MySuperWall — Make it beautiful. Make it live.](https://mysuperwall.com/assets/sdk/flutter-readme-hero-v1.png)](https://mysuperwall.com)
 
 # Beautiful paywalls. Delivered in Flutter.
@@ -41,7 +43,7 @@ Design in MySuperWall. Publish remotely. Show the right paywall in your app — 
 
 ```yaml
 dependencies:
-  mysuperwall_sdk: ^1.3.0
+  mysuperwall_sdk: ^1.3.1
 ```
 
 Requires **Flutter 3.35+ / Dart 3.9+**. Supports **iOS and Android**.
@@ -74,7 +76,7 @@ builder: (context, child) => MySuperWallHost(
 
 ### 3. Prepare once at startup
 
-When your store prices are available (for example after RevenueCat returns the current offering), push them once and warm the paywall you show most often. `MySuperWallHost` keeps one prepared paywall by default, so the next `handleTrigger` for that trigger opens instantly.
+When your store prices are available (for example after RevenueCat returns the current offering), push them once and warm the paywall you show most often. `MySuperWallHost` keeps one prepared paywall by default, so the next `handleTrigger` can reuse the loaded HTML after server validation.
 
 ```dart
 final client = MySuperWallClient.instance;
@@ -192,7 +194,7 @@ An anonymous user ID is generated when omitted during initialization. Language a
 <details>
 <summary><strong>Recovery paywalls &amp; restore completion</strong></summary>
 
-`handleTrigger` runs configured follow-up rules with once-per-session, cooldown, chain-depth and repeat protection. A legacy dismiss second screen uses the current manifest and retries synchronization when needed; offline recovery requires a cached target.
+`handleTrigger` runs configured follow-up rules with once-per-session, cooldown, chain-depth and repeat protection. In 1.3.1, a legacy dismiss second screen requires a freshly validated manifest; a cached target alone is insufficient.
 
 Pass real entitlement state through `setSubscriptionStatus(bool)` for rules using `skipIfPremium`. After a confirmed restore:
 
@@ -209,7 +211,7 @@ Purchase success rules follow host-confirmed completion calls. Existing `setAuto
 <details>
 <summary><strong>Caching, prefetching &amp; lifecycle triggers</strong></summary>
 
-The SDK caches manifests on disk and evaluates available rules locally. Use prefetching and `MySuperWallHost` to prepare views before presentation. An initial successful synchronization is needed before cached delivery is available.
+The SDK caches content on disk. Use prefetching and `MySuperWallHost` to prepare views before presentation. Every presentation still requires a successful server delivery decision; offline cached content cannot authorize display.
 
 Built-in lifecycle triggers include:
 

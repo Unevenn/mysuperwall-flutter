@@ -76,6 +76,7 @@ class ManifestService {
     String? lang,
     Map<String, dynamic>? substitutionData,
     Duration timeout = const Duration(seconds: 10),
+    bool allowCachedOnError = true,
   }) async {
     _activateScope(scope);
     final generation = _generation;
@@ -134,7 +135,9 @@ class ManifestService {
         '[MySuperWall] Background manifest sync failed (using offline cache if present): $e',
       );
     }
-    return _activeScope == scope && generation == _generation
+    return allowCachedOnError &&
+            _activeScope == scope &&
+            generation == _generation
         ? _currentManifest
         : null;
   }

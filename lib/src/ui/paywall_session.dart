@@ -1,3 +1,4 @@
+import 'paywall_visibility_script.dart';
 import '../models/paywall_state.dart';
 import '../services/sdk_endpoint.dart';
 import '../services/sdk_logging.dart';
@@ -71,12 +72,14 @@ class PreparedPaywallController with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    unawaited(_syncContentVisibility());
     if (state == AppLifecycleState.resumed) _reportVisibleAfterFrame();
   }
 
   void _markFailed() {
     if (_disposed) return;
     _loadFailed = true;
+    unawaited(_syncContentVisibility());
     isLoading.value = false;
     isReady.value = false;
     final completer = _readyCompleter;
@@ -121,8 +124,6 @@ class PreparedPaywallController with WidgetsBindingObserver {
       _openedAt == null ? 0 : DateTime.now().difference(_openedAt!).inSeconds;
 
   void activate(PaywallCallbacks callbacks) {
-    WidgetsBinding.instance.removeObserver(this);
-    WidgetsBinding.instance.addObserver(this);
     _callbacks = callbacks;
     _presentationFinished = false;
     _isPresentationVisible = null;
@@ -134,14 +135,15 @@ class PreparedPaywallController with WidgetsBindingObserver {
           : MySuperWallPaywallState.presenting,
     );
     _presentationSession++;
+    unawaited(_syncContentVisibility());
   }
 
   void deactivate() {
-    WidgetsBinding.instance.removeObserver(this);
     if (!_disposed && _callbacks != null) {
       onStateChanged?.call(MySuperWallPaywallState.dismissed);
     }
     _callbacks = null;
+    unawaited(_syncContentVisibility());
     _isPresentationVisible = null;
     _openedAt = null;
   }
@@ -189,16 +191,18 @@ class PreparedPaywallController with WidgetsBindingObserver {
 
   void dispose() {
     if (_disposed) return;
+    deactivate();
     _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
     _loadGeneration++;
     final completer = _readyCompleter;
     if (completer != null && !completer.isCompleted) completer.complete();
-    deactivate();
     isLoading.dispose();
     isReady.dispose();
   }
 
   void _configureController() {
+    WidgetsBinding.instance.addObserver(this);
     controller
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(defaultBackgroundColor)
@@ -225,6 +229,7 @@ class PreparedPaywallController with WidgetsBindingObserver {
           },
           onPageFinished: (String url) {
             if (_disposed) return;
+            unawaited(_syncContentVisibility());
             final finishedGeneration = _loadGeneration;
             unawaited(_markReadyFallback(finishedGeneration));
             if (Platform.isAndroid) {
@@ -242,7 +247,15 @@ class PreparedPaywallController with WidgetsBindingObserver {
       ..addJavaScriptChannel(
         'MySuperWall',
         onMessageReceived: (JavaScriptMessage message) {
-          final data = jsonDecode(message.message);
+          if (_disposed || _callbacks == null) return;
+          final Object? data;
+          try {
+            data = jsonDecode(message.message);
+          } on FormatException {
+            _logger.w('[MySuperWall] Ignored malformed bridge message.');
+            return;
+          }
+          if (data is! Map<String, dynamic>) return;
           final action = data['action'];
 
           if (action == 'purchase') {
@@ -296,6 +309,7 @@ class PreparedPaywallController with WidgetsBindingObserver {
       return;
     }
 
+    unawaited(_syncContentVisibility());
     isLoading.value = false;
     isReady.value = true;
     if (_readyCompleter != null && !_readyCompleter!.isCompleted) {
@@ -334,13 +348,18 @@ class PreparedPaywallController with WidgetsBindingObserver {
 
   var afterPaint = function () {
     try {
-      requestAnimationFrame(function () {
-        requestAnimationFrame(notifyReady);
+      // SDK readiness must work even while content frames are suspended.
+      var requestPaint = window.__mySuperWallRequestPaint ||
+          window.requestAnimationFrame.bind(window);
+      requestPaint(function () {
+        requestPaint(notifyReady);
       });
     } catch (_) {
       setTimeout(notifyReady, 80);
     }
   };
+
+  window.__mySuperWallNotifyAfterPaint = afterPaint;
 
   if (document.readyState === 'complete') {
     afterPaint();
@@ -351,6 +370,26 @@ class PreparedPaywallController with WidgetsBindingObserver {
 })();
 </script>
 ''';
+  }
+
+  Future<void> _syncContentVisibility() async {
+    if (!_configured || _disposed) return;
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    final visible =
+        _callbacks != null &&
+        !_loadFailed &&
+        (lifecycle == null || lifecycle == AppLifecycleState.resumed);
+    final requestPaint = visible && !_hasPaintSignal
+        ? 'window.__mySuperWallNotifyAfterPaint && window.__mySuperWallNotifyAfterPaint();'
+        : '';
+    try {
+      await controller.runJavaScript(
+        'window.__mySuperWallSetVisible && window.__mySuperWallSetVisible($visible);'
+        '$requestPaint',
+      );
+    } catch (error) {
+      _logger.w('[MySuperWall] Content visibility sync failed: $error');
+    }
   }
 
   Future<void> _installAndroidBackDismissBridge() async {
@@ -408,10 +447,10 @@ class PreparedPaywallController with WidgetsBindingObserver {
     if (headRegex.hasMatch(resultHtml)) {
       resultHtml = resultHtml.replaceFirstMapped(
         headRegex,
-        (match) => '${match.group(0)}$baseTag',
+        (match) => '${match.group(0)}$baseTag$paywallVisibilityScript',
       );
     } else {
-      resultHtml = '$baseTag$resultHtml';
+      resultHtml = '$baseTag$paywallVisibilityScript$resultHtml';
     }
 
     // 2. Inject PaintReady script before </body> or at the end

@@ -1,3 +1,10 @@
+## 1.3.1 - 2026-10-30
+
+- Revalidate trigger delivery with the backend before showing, including prepared presentation; discard cached/prepared content on a no-display decision. Cached HTML is no longer authorization to display offline. Network failures do not deliver stale paywalls.
+- Detach hidden prepared WebViews after loading or failure. Suspend CSS/Web Animations, animation-frame callbacks and media while hidden or backgrounded; resume on presentation. Keep SDK paint readiness independent of suspended content frames.
+- Handle malformed bridge messages safely and deactivate a prepared paywall when its last host unmounts.
+- Integrations must respect `show: false` and must not open a native/default paywall as a fallback.
+
 ## 1.3.0 - 2026-10-26
 
 - Add optional push notifications: `setPushToken` / `clearPushToken` register the app's FCM token for the current user and language (no Firebase dependency in the SDK), `trackNotificationOpened` reports a tap and returns the trigger to open, and `handleNotificationOpened` also presents it.
