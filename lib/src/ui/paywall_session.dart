@@ -36,6 +36,8 @@ class PreparedPaywallController with WidgetsBindingObserver {
   PreparedPaywallController({required this.paywall, this.onStateChanged});
 
   final ValueChanged<MySuperWallPaywallState>? onStateChanged;
+  Future<void> Function()? animateDismiss;
+  bool _dismissRequested = false;
   bool _hasPaintSignal = false;
   bool _loadFailed = false;
   bool _presentationFinished = false;
@@ -60,8 +62,9 @@ class PreparedPaywallController with WidgetsBindingObserver {
           !_hasPaintSignal ||
           _loadFailed ||
           _isPresentationVisible?.call() != true ||
-          (lifecycle != null && lifecycle != AppLifecycleState.resumed))
+          (lifecycle != null && lifecycle != AppLifecycleState.resumed)) {
         return;
+      }
       _shownReported = true;
       _openedAt = DateTime.now();
       onStateChanged?.call(MySuperWallPaywallState.visible);
@@ -125,6 +128,7 @@ class PreparedPaywallController with WidgetsBindingObserver {
 
   void activate(PaywallCallbacks callbacks) {
     _callbacks = callbacks;
+    _dismissRequested = false;
     _presentationFinished = false;
     _isPresentationVisible = null;
     _shownReported = false;
@@ -149,6 +153,8 @@ class PreparedPaywallController with WidgetsBindingObserver {
   }
 
   void dismiss() {
+    if (_disposed || _dismissRequested || _callbacks == null) return;
+    _dismissRequested = true;
     _callbacks?.onDismiss?.call(activeDurationInSeconds);
   }
 

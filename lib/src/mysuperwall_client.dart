@@ -3,6 +3,7 @@ import 'models/paywall_state.dart';
 import 'services/sdk_endpoint.dart';
 import 'models/log_level.dart';
 import 'services/sdk_logging.dart';
+import 'services/paywall_diagnostic_policy.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:collection';
@@ -26,7 +27,9 @@ import 'product_data_entry.dart';
 import 'services/paywall_cache_service.dart';
 import 'services/local_rule_engine.dart';
 import 'services/manifest_service.dart';
+import 'services/lifecycle_history.dart';
 import 'services/follow_up_service.dart';
+import 'services/pending_follow_up_service.dart';
 import 'services/offline_event_queue.dart';
 import 'ui/paywall_view.dart';
 import 'ui/paywall_session.dart';
@@ -53,11 +56,14 @@ class MySuperWallClient {
   int _flowGeneration = 0;
   PaywallData? _followUpPaywall;
   String? _followUpOutcomePaywallId;
+  String? _restoreRequestPaywallId;
+  int? _restoreRequestGeneration;
   void Function(String event, String? paywallId)? _followUpEvent;
 
   /// Pass the host billing provider's current entitlement; never inferred from taps.
   void setSubscriptionStatus(bool premium) {
     _subscriptionPremium = premium;
+    if (premium) unawaited(_cancelPendingPurchasedOffers());
   }
 
   final ValueNotifier<Map<String, MySuperWallPaywallState>> _paywallStates =
@@ -110,6 +116,98 @@ class MySuperWallClient {
   LocalRuleEngine get localRuleEngine => _localRuleEngine;
   OfflineEventQueue? get eventQueue => _eventQueue;
   final List<String> _pendingLifecycleTriggers = [];
+  final Map<String, DateTime> _pendingLifecycleDates = {};
+  bool _handlingLifecycleTriggers = false;
+  bool _presentationHandlersExplicit = false;
+  WeakReference<BuildContext>? _presentationHandlerOwner;
+  ValueChanged<String>? _presentationPurchase;
+  VoidCallback? _presentationRestore;
+  ValueChanged<String>? _presentationOpenUrl;
+  ValueChanged<String?>? _presentationOpenTerms;
+  ValueChanged<String?>? _presentationOpenPrivacy;
+
+  /// Registers app-level billing handlers shared by manual and automatic paywalls.
+  /// Existing presentation calls also register their supplied handlers.
+  void setPresentationHandlers({
+    required ValueChanged<String> onPurchase,
+    VoidCallback? onRestore,
+    ValueChanged<String>? onOpenUrl,
+    ValueChanged<String?>? onOpenTerms,
+    ValueChanged<String?>? onOpenPrivacy,
+  }) {
+    if (_disposed) return;
+    _presentationHandlersExplicit = true;
+    _presentationHandlerOwner = null;
+    _presentationPurchase = onPurchase;
+    _presentationRestore = onRestore;
+    _presentationOpenUrl = onOpenUrl;
+    _presentationOpenTerms = onOpenTerms;
+    _presentationOpenPrivacy = onOpenPrivacy;
+  }
+
+  bool get hasPresentationHandlers {
+    if (!_presentationHandlersExplicit &&
+        !(_presentationHandlerOwner?.target?.mounted ?? false)) {
+      // Inferred screen callbacks may retain State objects; release the whole
+      // bundle as soon as its owning context is no longer usable.
+      _presentationHandlerOwner = null;
+      _presentationPurchase = null;
+      _presentationRestore = null;
+      _presentationOpenUrl = null;
+      _presentationOpenTerms = null;
+      _presentationOpenPrivacy = null;
+    }
+    return !_disposed && _presentationPurchase != null;
+  }
+
+  void _rememberPresentationHandlers({
+    required BuildContext? owner,
+    ValueChanged<String>? onPurchase,
+    VoidCallback? onRestore,
+    ValueChanged<String>? onOpenUrl,
+    ValueChanged<String?>? onOpenTerms,
+    ValueChanged<String?>? onOpenPrivacy,
+  }) {
+    if (_disposed ||
+        _presentationHandlersExplicit ||
+        owner == null ||
+        !owner.mounted ||
+        onPurchase == null ||
+        identical(onPurchase, _presentationPurchase)) {
+      return;
+    }
+    // Keep one coherent bundle. Never combine restore/link callbacks from
+    // a different screen with a newly supplied purchase handler.
+    final weakOwner = WeakReference(owner);
+    bool valid() => weakOwner.target?.mounted ?? false;
+    _presentationHandlerOwner = weakOwner;
+    _presentationPurchase = (id) {
+      if (valid()) onPurchase(id);
+    };
+    _presentationRestore = onRestore == null
+        ? null
+        : () {
+            if (valid()) onRestore();
+          };
+    _presentationOpenUrl = onOpenUrl == null
+        ? null
+        : (url) {
+            if (valid()) onOpenUrl(url);
+          };
+    _presentationOpenTerms = onOpenTerms == null
+        ? null
+        : (url) {
+            if (valid()) onOpenTerms(url);
+          };
+    _presentationOpenPrivacy = onOpenPrivacy == null
+        ? null
+        : (url) {
+            if (valid()) onOpenPrivacy(url);
+          };
+  }
+
+  DateTime? _lifecycleActiveSince;
+  DateTime? _lifecycleBackgroundSince;
   // One prepared paywall by default, so MySuperWallHost keeps the preferred
   // trigger warm and handleTrigger presents it without rebuilding a WebView.
   // configurePreparedPaywallPool(maxCount: 0) opts out.
@@ -203,6 +301,29 @@ class MySuperWallClient {
     final clampedCount = maxCount.clamp(0, 3);
     _maxPreparedPaywalls = clampedCount;
     _trimPreparedPaywallPool();
+  }
+
+  static final Map<Object, BuildContext? Function()> _hostContextProviders = {};
+
+  /// Internal host bridge for prepared presentations that omit a context.
+  static void registerHostContextProvider(
+    Object host,
+    BuildContext? Function()? provider,
+  ) {
+    if (provider == null) {
+      _hostContextProviders.remove(host);
+    } else {
+      _hostContextProviders[host] = provider;
+    }
+  }
+
+  BuildContext? _followUpContext(BuildContext? supplied) {
+    if (supplied != null && supplied.mounted) return supplied;
+    for (final provider in _hostContextProviders.values) {
+      final context = provider();
+      if (context != null && context.mounted) return context;
+    }
+    return null;
   }
 
   static void registerHostMounted(bool mounted) {
@@ -378,7 +499,8 @@ class MySuperWallClient {
   void clearPreparedPaywallPool({List<String>? triggerKeys}) {
     if (triggerKeys != null && triggerKeys.isEmpty) return;
     final activeKey = _activePreparedTriggerKey.value;
-    if (activeKey != null && (triggerKeys == null || triggerKeys.contains(activeKey))) {
+    if (activeKey != null &&
+        (triggerKeys == null || triggerKeys.contains(activeKey))) {
       dismissPreparedPaywall();
     }
     if (triggerKeys == null) {
@@ -656,7 +778,11 @@ class MySuperWallClient {
       // Manage internal metrics
       await client._updateInternalMetrics(prefs);
       // Compute which lifecycle triggers apply this session
-      await client._computeLifecycleTriggers(prefs);
+      try {
+        await client._computeLifecycleTriggers(prefs);
+      } catch (error) {
+        _logger.w('[MySuperWall] Lifecycle initialization deferred: $error');
+      }
 
       // A token saved by an earlier session is refreshed at most once a day.
       unawaited(client._syncPushToken());
@@ -781,9 +907,11 @@ class MySuperWallClient {
 
   /// Internal: Handle session count and install date
   Future<void> _updateInternalMetrics(SharedPreferences prefs) async {
+    await _recordLifecycleHistory(prefs);
     // 1. Session Count
     final sessionCount = (prefs.getInt('mysuperwall_session_count') ?? 0) + 1;
     await prefs.setInt('mysuperwall_session_count', sessionCount);
+    await _recordLifecycleHistory(prefs);
 
     // 2. Install Date
     String? installDate = prefs.getString('mysuperwall_install_date');
@@ -797,54 +925,283 @@ class MySuperWallClient {
 
   /// Computes which system lifecycle triggers should fire this session.
   /// Called once during initialize(). Results stored in [_pendingLifecycleTriggers].
+  final Map<String, String> _lifecycleDiagnosticStates = {};
+
+  void _reportLifecycleStatus(String key, String status, String reason) {
+    final signature = '$status:$reason';
+    if (_disposed || _lifecycleDiagnosticStates[key] == signature) return;
+    _lifecycleDiagnosticStates[key] = signature;
+    _eventQueue?.enqueue({
+      'type': 'lifecycle_status',
+      'userId': _userId,
+      'triggerKey': key,
+      'metadata': {
+        'lifecycle_status': status,
+        'reason': reason,
+        if (_pendingLifecycleDates[key] != null)
+          'occurred_at': _pendingLifecycleDates[key]?.toIso8601String(),
+      },
+    });
+  }
+
+  /// Reports why automatic lifecycle presentation is currently deferred.
+  void reportLifecycleWaiting(String reason) {
+    for (final key in _pendingLifecycleTriggers) {
+      _reportLifecycleStatus(key, 'pending', reason);
+    }
+    unawaited(_flushEventQueue());
+  }
+
+  LifecycleHistory _lifecycleHistory(SharedPreferences prefs) =>
+      LifecycleHistory(prefs, '${_lifecycleQueueKey}_history');
+
+  bool _lifecycleHistoryHealthy = true;
+
+  Future<void> _recordLifecycleHistory(
+    SharedPreferences prefs, {
+    bool boundary = false,
+  }) async {
+    try {
+      await _lifecycleHistory(prefs).record(
+        DateTime.now().toUtc(),
+        prefs.getInt('mysuperwall_session_count') ?? 0,
+        prefs.getInt('mysuperwall_active_seconds') ?? 0,
+        boundary: boundary,
+      );
+      _lifecycleHistoryHealthy = true;
+    } catch (error) {
+      _lifecycleHistoryHealthy = false;
+      _logger.w('[MySuperWall] Lifecycle history unavailable: $error');
+    }
+  }
+
+  String get _lifecycleQueueKey =>
+      'mysuperwall_lifecycle_queue_${base64Url.encode(utf8.encode(jsonEncode([sdkServiceUrl, appKey])))}';
+
+  Future<void> _saveLifecycleQueue() async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    final saved = await prefs.setString(
+      _lifecycleQueueKey,
+      jsonEncode({
+        for (final entry in _pendingLifecycleDates.entries)
+          entry.key: entry.value.toUtc().toIso8601String(),
+      }),
+    );
+    if (!saved) throw StateError('Lifecycle queue could not be persisted');
+  }
+
   Future<void> _computeLifecycleTriggers(SharedPreferences prefs) async {
     _pendingLifecycleTriggers.clear();
+    _pendingLifecycleDates.clear();
+    final now = DateTime.now().toUtc();
+    try {
+      final raw = prefs.getString(_lifecycleQueueKey);
+      final decoded = raw == null ? null : jsonDecode(raw);
+      if (decoded is Map) {
+        for (final entry in decoded.entries) {
+          final date = DateTime.tryParse(entry.value.toString())?.toUtc();
+          if (entry.key is String &&
+              date != null &&
+              !date.isAfter(now) &&
+              now.difference(date) <= const Duration(days: 30)) {
+            _pendingLifecycleDates[entry.key as String] = date;
+          }
+        }
+      }
+    } catch (e) {
+      _logger.w('[MySuperWall] Invalid lifecycle queue: $e');
+    }
+
+    void enqueue(String key) {
+      _pendingLifecycleDates.putIfAbsent(key, () => now);
+    }
 
     final sessionCount = prefs.getInt('mysuperwall_session_count') ?? 1;
     final installStr = prefs.getString('mysuperwall_install_date');
-    final daysSince = installStr != null
-        ? DateTime.now().difference(DateTime.parse(installStr)).inDays
-        : 0;
-
-    String appVersion = 'unknown';
+    final installDate = installStr == null
+        ? null
+        : DateTime.tryParse(installStr);
+    final daysSince = installDate == null
+        ? 0
+        : now.difference(installDate.toUtc()).inDays;
+    String? appVersion;
     try {
-      final info = await PackageInfo.fromPlatform();
-      appVersion = info.version;
-    } catch (_) {}
+      appVersion = (await PackageInfo.fromPlatform()).version;
+    } catch (e) {
+      _logger.w('[MySuperWall] Could not read app version: $e');
+    }
 
-    // 1. App Install (first ever session)
+    // Older SDK versions set these flags before attempting presentation. Keep
+    // them as migration markers to avoid replaying already processed events.
     if (!prefs.containsKey('mysuperwall_lc_install_fired')) {
-      _pendingLifecycleTriggers.add('mysuperwall.install');
+      enqueue('mysuperwall.install');
+      await _saveLifecycleQueue();
       await prefs.setBool('mysuperwall_lc_install_fired', true);
     }
-
-    // 2. App Update (version change since last launch)
     final lastVersion = prefs.getString('mysuperwall_last_known_version');
-    if (lastVersion != null && lastVersion != appVersion) {
-      _pendingLifecycleTriggers.add('mysuperwall.update');
+    if (appVersion != null && appVersion.isNotEmpty) {
+      if (lastVersion != null &&
+          lastVersion != 'unknown' &&
+          lastVersion != appVersion) {
+        enqueue('mysuperwall.update');
+        await _saveLifecycleQueue();
+      }
+      await prefs.setString('mysuperwall_last_known_version', appVersion);
     }
-    await prefs.setString('mysuperwall_last_known_version', appVersion);
-
-    // 3. Every Session
     _pendingLifecycleTriggers.add('mysuperwall.session');
-
-    // 4. Session Milestones (fire once per milestone)
     for (final milestone in [3, 5, 10, 20, 50]) {
-      final key = 'mysuperwall_lc_session${milestone}_fired';
-      if (sessionCount >= milestone && !prefs.containsKey(key)) {
-        _pendingLifecycleTriggers.add('mysuperwall.session_$milestone');
-        await prefs.setBool(key, true);
+      final marker = 'mysuperwall_lc_session${milestone}_fired';
+      if (_lifecycleHistoryHealthy &&
+          sessionCount >= milestone &&
+          !prefs.containsKey(marker)) {
+        final occurred = _lifecycleHistory(
+          prefs,
+        ).crossing(session: true, threshold: milestone);
+        if (occurred != null &&
+            now.difference(occurred) <= const Duration(days: 30)) {
+          _pendingLifecycleDates.putIfAbsent(
+            'mysuperwall.session_$milestone',
+            () => occurred,
+          );
+          await _saveLifecycleQueue();
+        }
+        await prefs.setBool(marker, true);
       }
     }
-
-    // 5. Day Thresholds (fire once per threshold)
     for (final day in [1, 3, 7, 14, 30]) {
-      final key = 'mysuperwall_lc_day${day}_fired';
-      if (daysSince >= day && !prefs.containsKey(key)) {
-        _pendingLifecycleTriggers.add('mysuperwall.day_$day');
-        await prefs.setBool(key, true);
+      final marker = 'mysuperwall_lc_day${day}_fired';
+      if (daysSince >= day && !prefs.containsKey(marker)) {
+        final occurred = installDate?.toUtc().add(Duration(days: day));
+        if (occurred != null &&
+            now.difference(occurred) <= const Duration(days: 30)) {
+          _pendingLifecycleDates.putIfAbsent(
+            'mysuperwall.day_$day',
+            () => occurred,
+          );
+          await _saveLifecycleQueue();
+        }
+        await prefs.setBool(marker, true);
       }
     }
+    // Durable one-time events are checked before the recurring session event.
+    _pendingLifecycleTriggers.insertAll(0, _pendingLifecycleDates.keys);
+    for (final key in _pendingLifecycleTriggers) {
+      _reportLifecycleStatus(key, 'received', 'sdk_initialized');
+    }
+    await _saveLifecycleQueue();
+  }
+
+  /// Collects automatic lifecycle signals and refreshes configured thresholds.
+  /// Active time excludes time spent in the background.
+  Future<void> updateLifecycleSignals({
+    bool foreground = false,
+    bool background = false,
+  }) async {
+    final prefs = _prefs;
+    if (prefs == null || _disposed) return;
+    final now = DateTime.now().toUtc();
+    final previousBackground = foreground ? _lifecycleBackgroundSince : null;
+    if (foreground) _lifecycleBackgroundSince = null;
+    final started = _lifecycleActiveSince;
+    final elapsed = started == null ? 0 : now.difference(started).inSeconds;
+    if (background) {
+      _lifecycleActiveSince = null;
+      _lifecycleBackgroundSince ??= now;
+    } else {
+      // Commit each active interval before awaiting I/O. A lifecycle transition
+      // during manifest fetching must not count background time as active.
+      _lifecycleActiveSince = now;
+    }
+    if (elapsed > 0) {
+      await prefs.setInt(
+        'mysuperwall_active_seconds',
+        (prefs.getInt('mysuperwall_active_seconds') ?? 0) + elapsed,
+      );
+    }
+    await _recordLifecycleHistory(
+      prefs,
+      boundary: background || foreground || started == null,
+    );
+    if (background) return;
+    if (foreground) {
+      _foregroundSequence++;
+      if (!_pendingLifecycleTriggers.contains('mysuperwall.foreground')) {
+        _pendingLifecycleTriggers.add('mysuperwall.foreground');
+      }
+      final backgroundSince = previousBackground;
+      if (backgroundSince != null &&
+          now.difference(backgroundSince) >= const Duration(minutes: 30)) {
+        await prefs.setInt(
+          'mysuperwall_session_count',
+          (prefs.getInt('mysuperwall_session_count') ?? 0) + 1,
+        );
+        if (!_pendingLifecycleTriggers.contains('mysuperwall.session')) {
+          _pendingLifecycleTriggers.add('mysuperwall.session');
+        }
+      }
+    }
+    await _recordLifecycleHistory(prefs);
+    if (!_lifecycleHistoryHealthy) return;
+    final scope = _cacheScope;
+    await _syncManifestInBackground(requireFresh: true);
+    if (_disposed || scope != _cacheScope) return;
+    final manifest = _manifestService?.manifest;
+    if (manifest == null || _disposed) return;
+    final install = DateTime.tryParse(
+      prefs.getString('mysuperwall_install_date') ?? '',
+    )?.toUtc();
+    final sessions = prefs.getInt('mysuperwall_session_count') ?? 0;
+    final activeSeconds = prefs.getInt('mysuperwall_active_seconds') ?? 0;
+    final legacySessions = {3, 5, 10, 20, 50};
+    final legacyDays = {1, 3, 7, 14, 30};
+    for (final trigger in manifest.triggers) {
+      final match = RegExp(
+        r'^mysuperwall\.(session|day|active_minutes)_(\d+)$',
+      ).firstMatch(trigger.key);
+      if (match == null) continue;
+      final kind = match.group(1);
+      final threshold = int.tryParse(match.group(2) ?? '');
+      if (threshold == null || threshold < 1 || threshold > 100000) continue;
+      final reached = kind == 'session'
+          ? sessions >= threshold
+          : kind == 'day'
+          ? install != null && now.difference(install).inDays >= threshold
+          : activeSeconds >= threshold * 60;
+      if (!reached) continue;
+      final marker = kind == 'session' && legacySessions.contains(threshold)
+          ? 'mysuperwall_lc_session${threshold}_fired'
+          : kind == 'day' && legacyDays.contains(threshold)
+          ? 'mysuperwall_lc_day${threshold}_fired'
+          : 'mysuperwall_dynamic_${base64Url.encode(utf8.encode(trigger.key))}';
+      if (prefs.containsKey(marker)) continue;
+      final occurred = kind == 'day' && install != null
+          ? install.add(Duration(days: threshold))
+          : _lifecycleHistory(prefs).crossing(
+              session: kind == 'session',
+              threshold: kind == 'session' ? threshold : threshold * 60,
+            );
+      if (occurred != null &&
+          now.difference(occurred) <= const Duration(days: 30)) {
+        _pendingLifecycleDates.putIfAbsent(trigger.key, () => occurred);
+        if (!_pendingLifecycleTriggers.contains(trigger.key)) {
+          _pendingLifecycleTriggers.insert(0, trigger.key);
+          _reportLifecycleStatus(trigger.key, 'received', 'threshold_reached');
+        }
+        await _saveLifecycleQueue();
+      }
+      if (occurred == null) {
+        _reportLifecycleStatus(
+          trigger.key,
+          'rejected',
+          'historical_timestamp_unavailable',
+        );
+      } else if (now.difference(occurred) > const Duration(days: 30)) {
+        _reportLifecycleStatus(trigger.key, 'expired', 'retention_exceeded');
+      }
+      await prefs.setBool(marker, true);
+    }
+    unawaited(_flushEventQueue());
   }
 
   // ── Public Lifecycle API ───────────────────────────────────────────────────
@@ -868,24 +1225,101 @@ class MySuperWallClient {
     Function(String productId)? onPurchase,
     VoidCallback? onRestore,
     VoidCallback? onDismiss,
+    bool Function()? canPresent,
   }) async {
-    for (final triggerKey in List.of(_pendingLifecycleTriggers)) {
-      try {
-        final result = await handleTrigger(
-          context,
-          triggerKey: triggerKey,
-          onPurchase: onPurchase,
-          onRestore: onRestore,
-          onDismiss: onDismiss,
-        );
-        // Stop at first paywall shown — don't bombard the user
-        if (result.show) {
-          _logger.i('[MySuperWall] Lifecycle trigger shown: $triggerKey');
+    final useSharedHandlers = onPurchase == null && hasPresentationHandlers;
+    if (useSharedHandlers) {
+      onPurchase = _presentationPurchase;
+      onRestore ??= _presentationRestore;
+    }
+    if (_handlingLifecycleTriggers || _disposed) return;
+    _handlingLifecycleTriggers = true;
+    try {
+      // A host may remain alive for longer than the retention window.
+      final now = DateTime.now().toUtc();
+      final expired = _pendingLifecycleDates.entries
+          .where(
+            (entry) =>
+                entry.value.isAfter(now) ||
+                now.difference(entry.value) > const Duration(days: 30),
+          )
+          .map((entry) => entry.key)
+          .toList();
+      for (final key in expired) {
+        _reportLifecycleStatus(key, 'expired', 'retention_exceeded');
+        _pendingLifecycleDates.remove(key);
+        _pendingLifecycleTriggers.remove(key);
+      }
+      if (expired.isNotEmpty) await _saveLifecycleQueue();
+      // A built-in signal can exist without any configured trigger. Keep it
+      // pending for future configuration, but do not request delivery or start
+      // a presentation flow just to discover it is absent.
+      if (_manifestService?.manifest == null &&
+          !await _syncManifestInBackground(requireFresh: true)) {
+        return;
+      }
+      final lifecycleManifest = _manifestService?.manifest;
+      if (lifecycleManifest == null || _disposed) return;
+      final ordered = List<String>.of(_pendingLifecycleTriggers)
+        ..sort((a, b) {
+          final manifest = _manifestService?.manifest;
+          final priority = (manifest?.findTrigger(b)?.prewarmPriority ?? 0)
+              .compareTo(manifest?.findTrigger(a)?.prewarmPriority ?? 0);
+          if (priority != 0) return priority;
+          final age = (_pendingLifecycleDates[a] ?? now).compareTo(
+            _pendingLifecycleDates[b] ?? now,
+          );
+          return age != 0 ? age : a.compareTo(b);
+        });
+      for (final triggerKey in ordered) {
+        if (!context.mounted || _disposed || canPresent?.call() == false) break;
+        if (lifecycleManifest.findTrigger(triggerKey) == null) continue;
+        try {
+          final result = await handleTrigger(
+            context,
+            triggerKey: triggerKey,
+            presentationGuard: canPresent,
+            onPurchase: onPurchase,
+            onRestore: onRestore,
+            onDismiss: onDismiss,
+            onOpenUrl: useSharedHandlers ? _presentationOpenUrl : null,
+            onOpenTerms: useSharedHandlers ? _presentationOpenTerms : null,
+            onOpenPrivacy: useSharedHandlers ? _presentationOpenPrivacy : null,
+          );
+          if (result.show) {
+            // Completion is committed by the actual paywall_shown callback.
+            _logger.i(
+              '[MySuperWall] Lifecycle presentation started: $triggerKey',
+            );
+            break;
+          }
+          _reportLifecycleStatus(
+            triggerKey,
+            'pending',
+            result.reason ?? 'no_match',
+          );
+          _logger.d(
+            '[MySuperWall] Lifecycle trigger pending: $triggerKey (${result.reason})',
+          );
+          if (result.reason == 'presentation_in_progress' ||
+              result.reason == 'identity_changed' ||
+              result.reason == 'sdk_disposed' ||
+              result.reason == 'presentation_deferred') {
+            break;
+          }
+        } catch (e) {
+          _reportLifecycleStatus(
+            triggerKey,
+            'pending',
+            'presentation_or_network_failure',
+          );
+          _logger.w('[MySuperWall] Lifecycle trigger failed: $triggerKey — $e');
           break;
         }
-      } catch (e) {
-        _logger.w('[MySuperWall] Lifecycle trigger failed: $triggerKey — $e');
       }
+    } finally {
+      _handlingLifecycleTriggers = false;
+      unawaited(_flushEventQueue());
     }
   }
 
@@ -895,6 +1329,7 @@ class MySuperWallClient {
   /// Pair with handleLifecycleTriggers() for instant display.
   Future<void> prefetchLifecycleTriggers() async {
     for (final triggerKey in List.of(_pendingLifecycleTriggers)) {
+      if (_manifestService?.manifest?.findTrigger(triggerKey) == null) continue;
       try {
         await prefetchPaywall(triggerKey: triggerKey);
       } catch (_) {
@@ -955,6 +1390,12 @@ class MySuperWallClient {
 
   void _clearIdentityState() {
     _flowGeneration++;
+    _pendingOfferTimer?.cancel();
+    _pendingOfferDisplay = null;
+    _pendingOfferCallbacks.clear();
+    _pendingOfferOwners.clear();
+    _restoreRequestPaywallId = null;
+    _restoreRequestGeneration = null;
     _followUps.reset();
     _followUpEvent = null;
     _followUpPaywall = null;
@@ -986,13 +1427,35 @@ class MySuperWallClient {
   }
 
   /// Dismisses the currently presented prepared paywall, if any.
+  Future<void>? _preparedDismissal;
+
   void dismissPreparedPaywall() {
+    if (_preparedDismissal != null) return;
     final activeKey = _activePreparedTriggerKey.value;
-    if (activeKey != null) {
-      _preparedPaywallPool[activeKey]?.deactivate();
+    if (activeKey == null) return;
+    final controller = _preparedPaywallPool[activeKey];
+    final animation = controller?.animateDismiss;
+    if (animation == null || _disposed) {
+      controller?.deactivate();
+      _activePreparedTriggerKey.value = null;
+      _removePreparedBackInterceptor();
+      return;
     }
-    _activePreparedTriggerKey.value = null;
-    _removePreparedBackInterceptor();
+    _preparedDismissal = () async {
+      try {
+        await animation();
+      } catch (error) {
+        _logger.d('[MySuperWall] Dismiss transition interrupted: $error');
+      } finally {
+        if (_activePreparedTriggerKey.value == activeKey &&
+            identical(_preparedPaywallPool[activeKey], controller)) {
+          controller?.deactivate();
+          _activePreparedTriggerKey.value = null;
+          _removePreparedBackInterceptor();
+        }
+        _preparedDismissal = null;
+      }
+    }();
   }
 
   void _installPreparedBackInterceptor(
@@ -1008,7 +1471,15 @@ class MySuperWallClient {
       transitionDuration: Duration.zero,
       reverseTransitionDuration: Duration.zero,
       pageBuilder: (context, animation, secondaryAnimation) {
-        return const IgnorePointer(ignoring: true, child: SizedBox.expand());
+        return PopScope<void>(
+          canPop:
+              _preparedPaywallPool[triggerKey]
+                  ?.paywall
+                  .presentation
+                  .allowsSystemBack ??
+              false,
+          child: const IgnorePointer(ignoring: true, child: SizedBox.expand()),
+        );
       },
       transitionsBuilder: (context, animation, secondaryAnimation, child) {
         return child;
@@ -1199,10 +1670,14 @@ class MySuperWallClient {
   }) {
     final reason = result.reason ?? 'unknown_reason';
     final message = result.message ?? 'Backend returned show=false.';
-    _logger.e(
-      '[MySuperWall] No paywall shown during $phase for trigger "$triggerKey". '
-      'reason=$reason message=$message details=${result.details}',
-    );
+    final diagnostic =
+        '[MySuperWall] No paywall shown during $phase for trigger "$triggerKey". '
+        'reason=$reason message=$message details=${result.details}';
+    if (PaywallDiagnosticPolicy.isExpectedNoDisplay(result.reason)) {
+      _logger.d(diagnostic);
+    } else {
+      _logger.e(diagnostic);
+    }
   }
 
   Future<void> _cacheResolvedPaywall(
@@ -1436,6 +1911,8 @@ class MySuperWallClient {
           },
           onRestore: () {
             if (presentationScope == _cacheScope) {
+              _restoreRequestPaywallId = paywall.id;
+              _restoreRequestGeneration = _flowGeneration;
               _trackDisplayedEvent('restore_started', paywall, triggerKey);
             }
             onRestore?.call();
@@ -1495,6 +1972,7 @@ class MySuperWallClient {
     PaywallView.show(
       context,
       paywall: paywall,
+      trackDismissInternally: false,
       onShown: () {
         if (presentationScope == _cacheScope) {
           _trackDisplayedEvent('paywall_shown', paywall, triggerKey);
@@ -1523,6 +2001,8 @@ class MySuperWallClient {
       },
       onRestore: () {
         if (presentationScope == _cacheScope) {
+          _restoreRequestPaywallId = paywall.id;
+          _restoreRequestGeneration = _flowGeneration;
           _trackDisplayedEvent('restore_started', paywall, triggerKey);
         }
         if (onRestore != null) {
@@ -1558,6 +2038,14 @@ class MySuperWallClient {
     ValueChanged<String?>? onOpenTerms,
     ValueChanged<String?>? onOpenPrivacy,
   }) async {
+    _rememberPresentationHandlers(
+      owner: presentationContext,
+      onPurchase: onPurchase,
+      onRestore: onRestore,
+      onOpenUrl: onOpenUrl,
+      onOpenTerms: onOpenTerms,
+      onOpenPrivacy: onOpenPrivacy,
+    );
     if (_disposed || _hasActivePresentation) return false;
     _presentationInProgress = true;
     try {
@@ -1589,9 +2077,38 @@ class MySuperWallClient {
       _logger.i(
         '[MySuperWall] Presenting already-prepared paywall for trigger "$triggerKey".',
       );
+      _flowGeneration++;
+      _restoreRequestPaywallId = null;
+      _restoreRequestGeneration = null;
+      _followUps.cancel();
+      _followUpEvent = null;
+      _followUpPaywall = null;
+      _followUpOutcomePaywallId = null;
+      final followUpContext = _followUpContext(presentationContext);
+      if (followUpContext != null) {
+        _bindFollowUp(
+          followUpContext,
+          result.paywall!,
+          depth: 0,
+          visited: const [],
+          legacyPaywallId: _manifestService?.manifest
+              ?.findTrigger(triggerKey)
+              ?.dismissFollowUpPaywallId,
+          onPurchase: onPurchase,
+          onRestore: onRestore,
+          onDismiss: onDismiss,
+          onOpenUrl: onOpenUrl,
+          onOpenTerms: onOpenTerms,
+          onOpenPrivacy: onOpenPrivacy,
+        );
+      } else {
+        _logger.w(
+          '[MySuperWall] Follow-up requires a mounted host or presentation context.',
+        );
+      }
       _incrementViewCount();
       await _presentPreparedPaywall(
-        presentationContext,
+        followUpContext,
         triggerKey,
         result,
         onPurchase: onPurchase,
@@ -1683,6 +2200,7 @@ class MySuperWallClient {
         if (_locale != null) 'lang': _locale,
         'metadata': {...?metadata, ...systemMetadata},
         'substitutionData': _productData,
+        'sdkCapabilities': ['deferred_follow_up_v1'],
       };
 
       final response = await _httpClient
@@ -1918,6 +2436,7 @@ class MySuperWallClient {
       if (_locale != null) 'lang': _locale,
       'metadata': {...?metadata, ...systemMetadata},
       'substitutionData': _productData,
+      'sdkCapabilities': ['deferred_follow_up_v1'],
     };
 
     final response = await _httpClient
@@ -1969,7 +2488,16 @@ class MySuperWallClient {
     ValueChanged<String>? onOpenUrl,
     ValueChanged<String?>? onOpenTerms,
     ValueChanged<String?>? onOpenPrivacy,
+    bool Function()? presentationGuard,
   }) async {
+    _rememberPresentationHandlers(
+      owner: context,
+      onPurchase: onPurchase,
+      onRestore: onRestore,
+      onOpenUrl: onOpenUrl,
+      onOpenTerms: onOpenTerms,
+      onOpenPrivacy: onOpenPrivacy,
+    );
     if (_disposed || _hasActivePresentation) {
       return PaywallResult(
         show: false,
@@ -1980,6 +2508,8 @@ class MySuperWallClient {
     _presentationInProgress = true;
     try {
       _flowGeneration++;
+      _restoreRequestPaywallId = null;
+      _restoreRequestGeneration = null;
       _followUps.cancel();
       _followUpEvent = null;
       _followUpPaywall = null;
@@ -1987,6 +2517,7 @@ class MySuperWallClient {
       return await _handleTrigger(
         context,
         triggerKey: triggerKey,
+        presentationGuard: presentationGuard,
         metadata: metadata,
         onPurchase: onPurchase,
         onRestore: onRestore,
@@ -2010,10 +2541,17 @@ class MySuperWallClient {
     ValueChanged<String>? onOpenUrl,
     ValueChanged<String?>? onOpenTerms,
     ValueChanged<String?>? onOpenPrivacy,
+    bool Function()? presentationGuard,
     int followUpDepth = 0,
     List<String> followUpVisited = const [],
     bool preventFollowUpRepeat = true,
   }) async {
+    PaywallResult deferred() => const PaywallResult(
+      show: false,
+      paywall: null,
+      reason: 'presentation_deferred',
+    );
+    if (presentationGuard?.call() == false) return deferred();
     final scope = _cacheScope;
     _updatePaywallState(triggerKey, MySuperWallPaywallState.loading);
     try {
@@ -2036,6 +2574,11 @@ class MySuperWallClient {
           paywall: null,
           reason: 'identity_changed',
         );
+      }
+      if (presentationGuard?.call() == false) return deferred();
+      if (_pendingLifecycleTriggers.contains(triggerKey) ||
+          _pendingOfferDisplay?['key'] == triggerKey) {
+        _reportLifecycleStatus(triggerKey, 'matched', 'server_authorized');
       }
       // Increment global view count for analytics
       _incrementViewCount();
@@ -2117,6 +2660,7 @@ class MySuperWallClient {
             reason: 'identity_changed',
           );
         }
+        if (presentationGuard?.call() == false) return deferred();
         if (preparedController.hasCompletedInitialLoad) {
           _logger.i(
             '[MySuperWall] Using prepared ready paywall for trigger "$triggerKey".',
@@ -2146,6 +2690,10 @@ class MySuperWallClient {
               reason: 'identity_changed',
             );
           }
+          if (presentationGuard?.call() == false) {
+            preparedRouteController.dispose();
+            return deferred();
+          }
           _presentRoutePaywall(
             context,
             triggerKey: triggerKey,
@@ -2170,6 +2718,10 @@ class MySuperWallClient {
             paywall: null,
             reason: 'identity_changed',
           );
+        }
+        if (presentationGuard?.call() == false) {
+          preparedRouteController.dispose();
+          return deferred();
         }
         _presentRoutePaywall(
           context,
@@ -2217,6 +2769,309 @@ class MySuperWallClient {
     return (value == null || value.isEmpty) ? null : value;
   }
 
+  String _followUpPolicySignature(Map policy) {
+    final keys = policy.keys.whereType<String>().toList()..sort();
+    return jsonEncode({for (final key in keys) key: policy[key]});
+  }
+
+  Timer? _pendingOfferTimer;
+  void _wakePendingFollowUps(Duration delay) {
+    _pendingOfferTimer?.cancel();
+    _pendingOfferTimer = Timer(delay, () {
+      if (_disposed) return;
+      final context = _followUpContext(null);
+      if (context == null) return;
+      unawaited(
+        handlePendingFollowUps(
+          context,
+          canPresent: () =>
+              !_disposed &&
+              isHostMounted &&
+              WidgetsBinding.instance.lifecycleState ==
+                  AppLifecycleState.resumed,
+        ),
+      );
+    });
+  }
+
+  PendingFollowUpService? get _pendingOffers {
+    final prefs = _prefs;
+    if (prefs == null) return null;
+    final scope = jsonEncode([sdkServiceUrl, appKey, _userId]);
+    return PendingFollowUpService(
+      prefs,
+      'mysuperwall_pending_offers_${base64Url.encode(utf8.encode(scope))}',
+    );
+  }
+
+  Future<void> _cancelPendingPurchasedOffers() async {
+    try {
+      await _pendingOffers?.cancelPurchasedOffers();
+    } catch (error) {
+      _logger.w('[MySuperWall] Could not cancel pending offers: $error');
+    }
+  }
+
+  int _foregroundSequence = 0;
+  bool _pendingOfferRunning = false;
+  final Map<String, PaywallCallbacks> _pendingOfferCallbacks = {};
+  final Map<String, WeakReference<BuildContext>> _pendingOfferOwners = {};
+  Map<String, dynamic>? _pendingOfferDisplay;
+
+  Future<bool> _enqueueDeferredOffer(
+    PaywallData paywall,
+    String event,
+    Map<String, dynamic> rule,
+    int depth,
+    List<String> seen,
+    BuildContext owner,
+    PaywallCallbacks callbacks,
+    Map<String, dynamic>? metadata,
+  ) async {
+    final store = _pendingOffers;
+    if (store == null || _disposed) return false;
+    final now = DateTime.now().toUtc();
+    final id = '${paywall.id}:$event:${rule['triggerKey']}';
+    final session = _prefs?.getInt('mysuperwall_session_count') ?? 1;
+    final maxDepth = (rule['maxChainDepth'] as num?)?.toInt() ?? 2;
+    if (depth >= maxDepth ||
+        (rule['skipIfPremium'] == true && _subscriptionPremium) ||
+        !store.allowed(id, rule, session, now)) {
+      return false;
+    }
+    final activeSince = _lifecycleActiveSince;
+    final elapsedActive = activeSince == null
+        ? 0
+        : now.difference(activeSince).inSeconds;
+    await store.enqueue({
+      'id': id,
+      'sourceId': paywall.id,
+      'sourceTrigger': paywall.triggerKey,
+      'event': event,
+      'rule': rule,
+      'policy': _followUpPolicySignature(rule),
+      'created': now.toIso8601String(),
+      'session': session,
+      'foreground': _foregroundSequence,
+      'active':
+          (_prefs?.getInt('mysuperwall_active_seconds') ?? 0) +
+          (elapsedActive > 0 ? elapsedActive : 0),
+      'depth': depth,
+      'seen': seen,
+      if (metadata != null) 'metadata': metadata,
+    });
+    _pendingOfferCallbacks[id] = callbacks;
+    _pendingOfferOwners[id] = WeakReference(owner);
+    _reportLifecycleStatus(
+      rule['triggerKey'].toString(),
+      'pending',
+      'follow_up_scheduled',
+    );
+    final mode = rule['timingMode'];
+    final delay = mode == 'immediate'
+        ? Duration(
+            milliseconds: ((rule['delayMs'] as num?)?.toInt() ?? 0) + 350,
+          )
+        : mode == 'elapsed'
+        ? Duration(minutes: (rule['waitMinutes'] as num?)?.toInt() ?? 10)
+        : const Duration(seconds: 15);
+    _wakePendingFollowUps(delay);
+    return true;
+  }
+
+  /// Called by the host after metrics refresh. Deferred offers never interrupt
+  /// another paywall and always request a fresh server delivery decision.
+  Future<bool> handlePendingFollowUps(
+    BuildContext context, {
+    required bool Function() canPresent,
+  }) async {
+    if (_disposed ||
+        _automationActionHandler != null ||
+        _pendingOfferRunning ||
+        hostLoadingOverlayListenable.value ||
+        _hasActivePresentation ||
+        !canPresent()) {
+      return false;
+    }
+    final store = _pendingOffers;
+    final prefs = _prefs;
+    if (store == null || prefs == null || store.jobs.isEmpty) return false;
+    _pendingOfferRunning = true;
+    final scope = _cacheScope;
+    try {
+      if (!await _syncManifestInBackground(requireFresh: true) ||
+          scope != _cacheScope) {
+        return false;
+      }
+      final now = DateTime.now().toUtc();
+      final session = prefs.getInt('mysuperwall_session_count') ?? 1;
+      final install = DateTime.tryParse(
+        prefs.getString('mysuperwall_install_date') ?? '',
+      );
+      for (final job in store.jobs) {
+        if (_disposed ||
+            scope != _cacheScope ||
+            !canPresent() ||
+            hostLoadingOverlayListenable.value ||
+            _hasActivePresentation) {
+          return false;
+        }
+        final id = job['id']?.toString();
+        final rule = job['rule'];
+        final created = DateTime.tryParse(job['created']?.toString() ?? '');
+        if (id == null || rule is! Map<String, dynamic> || created == null) {
+          continue;
+        }
+        void waiting(String reason) => _reportLifecycleStatus(
+          rule['triggerKey'].toString(),
+          'pending',
+          reason,
+        );
+        final expiry = (rule['expiresMinutes'] as num?)?.toInt() ?? 1440;
+        if (now.difference(created).inMinutes >= expiry ||
+            (_subscriptionPremium && rule['cancelOnPurchase'] != false)) {
+          _reportLifecycleStatus(
+            rule['triggerKey'].toString(),
+            'expired',
+            _subscriptionPremium
+                ? 'follow_up_cancelled_after_purchase'
+                : 'follow_up_expired',
+          );
+          await store.remove(id);
+          continue;
+        }
+        if (_subscriptionPremium && rule['skipIfPremium'] == true) {
+          waiting('premium_user');
+          continue;
+        }
+        if (rule['excludeFirstSession'] == true && session <= 1) {
+          waiting('first_session_excluded');
+          continue;
+        }
+        if (session < ((rule['minSessions'] as num?)?.toInt() ?? 1)) {
+          waiting('minimum_sessions');
+          continue;
+        }
+        if ((install == null ? 0 : now.difference(install).inDays) <
+            ((rule['minDays'] as num?)?.toInt() ?? 0)) {
+          continue;
+        }
+        if (!store.allowed(id, rule, session, now)) {
+          waiting('follow_up_frequency_limit');
+          continue;
+        }
+        final wait = (rule['waitMinutes'] as num?)?.toInt() ?? 10;
+        final mode = rule['timingMode'];
+        if (mode == 'immediate' &&
+            now.difference(created).inMilliseconds <
+                ((rule['delayMs'] as num?)?.toInt() ?? 0)) {
+          continue;
+        }
+
+        if (mode == 'elapsed' &&
+            now.difference(created).inSeconds < wait * 60) {
+          continue;
+        }
+        if (mode == 'active' &&
+            (prefs.getInt('mysuperwall_active_seconds') ?? 0) -
+                    ((job['active'] as num?)?.toInt() ?? 0) <
+                wait * 60) {
+          continue;
+        }
+        if (mode == 'next_session' &&
+            session <= ((job['session'] as num?)?.toInt() ?? session)) {
+          continue;
+        }
+        if (mode == 'next_foreground' &&
+            session <= ((job['session'] as num?)?.toInt() ?? session) &&
+            _foregroundSequence <=
+                ((job['foreground'] as num?)?.toInt() ?? _foregroundSequence)) {
+          continue;
+        }
+        // Source policy must still be published and unchanged. A removed rule
+        // must not survive indefinitely in the installation's pending queue.
+        final source = _manifestService?.manifest?.paywalls[job['sourceId']];
+        final rules = source?.contentJson['followUpRules'];
+        final current = rules is Map ? rules[job['event']] : null;
+        if (current is! Map ||
+            current['enabled'] != true ||
+            _followUpPolicySignature(current) !=
+                _followUpPolicySignature(rule)) {
+          _reportLifecycleStatus(
+            rule['triggerKey'].toString(),
+            'rejected',
+            'follow_up_policy_changed',
+          );
+          await store.remove(id);
+          continue;
+        }
+        final inferred = _pendingOfferOwners[id]?.target;
+        if (inferred?.mounted != true) {
+          _pendingOfferOwners.remove(id);
+          _pendingOfferCallbacks.remove(id);
+        }
+        final callbacks = inferred?.mounted == true
+            ? _pendingOfferCallbacks[id]
+            : null;
+        if (callbacks?.onPurchase == null && !hasPresentationHandlers) {
+          waiting('billing_handlers_unavailable');
+          continue;
+        }
+        _presentationInProgress = true;
+        _flowGeneration++;
+        _followUps.cancel();
+        _pendingOfferDisplay = {
+          'id': id,
+          'key': rule['triggerKey'],
+          'scope': scope,
+          'session': session,
+          'generation': _flowGeneration,
+        };
+        try {
+          final result = await _handleTrigger(
+            context,
+            triggerKey: rule['triggerKey'].toString(),
+            metadata: job['metadata'] is Map<String, dynamic>
+                ? Map<String, dynamic>.from(job['metadata'])
+                : null,
+            followUpDepth: ((job['depth'] as num?)?.toInt() ?? 0) + 1,
+            followUpVisited: (job['seen'] as List? ?? [])
+                .whereType<String>()
+                .toList(),
+            preventFollowUpRepeat: rule['preventRepeatPaywall'] != false,
+            presentationGuard: () =>
+                scope == _cacheScope &&
+                canPresent() &&
+                !(_subscriptionPremium &&
+                    (rule['skipIfPremium'] == true ||
+                        rule['cancelOnPurchase'] != false)),
+            onPurchase: callbacks?.onPurchase ?? _presentationPurchase,
+            onRestore: callbacks?.onRestore ?? _presentationRestore,
+            onDismiss: callbacks?.onDismiss == null
+                ? null
+                : () => callbacks?.onDismiss?.call(0),
+            onOpenUrl: callbacks?.onOpenUrl ?? _presentationOpenUrl,
+            onOpenTerms: callbacks?.onOpenTerms ?? _presentationOpenTerms,
+            onOpenPrivacy: callbacks?.onOpenPrivacy ?? _presentationOpenPrivacy,
+          );
+          if (!result.show) {
+            _pendingOfferDisplay = null;
+            waiting(result.reason ?? 'no_match');
+          }
+          return result.show;
+        } finally {
+          _presentationInProgress = false;
+        }
+      }
+    } catch (error) {
+      _pendingOfferDisplay = null;
+      _logger.w('[MySuperWall] Pending follow-up failed: $error');
+    } finally {
+      _pendingOfferRunning = false;
+    }
+    return false;
+  }
+
   void _bindFollowUp(
     BuildContext context,
     PaywallData paywall, {
@@ -2236,12 +3091,27 @@ class MySuperWallClient {
     final generation = _flowGeneration;
     final scope = _cacheScope;
     final seen = [...visited, paywall.id];
-    bool valid() =>
+    bool flowValid() =>
         !_disposed &&
-        identical(_followUpPaywall, paywall) &&
         generation == _flowGeneration &&
         scope == _cacheScope &&
         context.mounted;
+    bool valid() => flowValid() && identical(_followUpPaywall, paywall);
+    Future<bool> closeSource() async {
+      dismiss();
+      for (var attempt = 0; attempt < 100; attempt++) {
+        if (!valid()) return false;
+        if (!PaywallView.isShowing && _activePreparedTriggerKey.value == null) {
+          return true;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+      _logger.w(
+        '[MySuperWall] Follow-up deferred: source paywall is still closing.',
+      );
+      return false;
+    }
+
     final followUpRules = paywall.contentJson['followUpRules'];
     _followUpEvent = (event, sourcePaywallId) {
       if (!valid() ||
@@ -2252,9 +3122,7 @@ class MySuperWallClient {
       if (event == 'onDismiss' && _followUpOutcomePaywallId == paywall.id) {
         return;
       }
-      if (event == 'onPurchase' ||
-          event == 'onRestore' ||
-          event == 'onPurchaseFailed') {
+      if (event == 'onPurchase' || event == 'onRestore') {
         _followUpOutcomePaywallId = paywall.id;
       }
       final raw = followUpRules is Map ? followUpRules[event] : null;
@@ -2266,10 +3134,12 @@ class MySuperWallClient {
       final legacy =
           legacyPaywallId ??
           paywall.contentJson['followUpPaywallId']?.toString();
+      if (!explicit && raw is Map) return;
       if (!explicit &&
-          (event != 'onDismiss' ||
+          (legacy == null ||
+              event != 'onDismiss' ||
               depth != 0 ||
-              (legacy != null && seen.contains(legacy)))) {
+              seen.contains(legacy))) {
         return;
       }
       final rule = explicit
@@ -2280,114 +3150,165 @@ class MySuperWallClient {
               'triggerKey': 'legacy',
               'maxChainDepth': 1,
             };
-      _followUps.schedule(
+      if (explicit && rule['timingMode'] != null) {
+        unawaited(
+          _enqueueDeferredOffer(
+                paywall,
+                event,
+                rule,
+                depth,
+                seen,
+                context,
+                PaywallCallbacks(
+                  onPurchase: onPurchase,
+                  onRestore: onRestore,
+                  onDismiss: (_) => onDismiss?.call(),
+                  onOpenUrl: onOpenUrl,
+                  onOpenTerms: onOpenTerms,
+                  onOpenPrivacy: onOpenPrivacy,
+                ),
+                metadata,
+              )
+              .then<void>((scheduled) {
+                if (scheduled &&
+                    valid() &&
+                    rule['timingMode'] == 'immediate' &&
+                    event != 'onDismiss') {
+                  dismiss();
+                }
+              })
+              .catchError((Object error) {
+                _logger.w('[MySuperWall] Could not schedule follow-up: $error');
+              }),
+        );
+        if (event == 'onPurchaseCancelled' || event == 'onPurchaseFailed') {
+          _followUpOutcomePaywallId = paywall.id;
+        }
+        return;
+      }
+      final scheduled = _followUps.schedule(
         key: '${paywall.id}:$event:${rule['triggerKey']}',
         rule: rule,
         depth: depth,
         premium: _subscriptionPremium,
+        onError: (error) => _logger.w('[MySuperWall] Follow-up failed: $error'),
         run: () async {
-          if (!valid() ||
-              (rule['skipIfPremium'] == true && _subscriptionPremium)) {
-            return;
-          }
-          if (explicit) {
-            final nextKey = rule['triggerKey'].toString();
-            final manifest = _manifestService?.manifest;
-            final nextTrigger = manifest?.findTrigger(nextKey);
-            if (manifest != null &&
-                nextTrigger != null &&
-                rule['preventRepeatPaywall'] != false) {
-              final resolution = LocalRuleEngine().resolveTrigger(
-                trigger: nextTrigger,
-                userId: _userId,
-                context: {
-                  'platform': Platform.isIOS ? 'ios' : 'android',
-                  'country': _country ?? _deviceCountry,
-                  'metadata': metadata ?? <String, dynamic>{},
-                  'userAttributes': metadata ?? <String, dynamic>{},
-                },
+          if (_presentationInProgress) return false;
+          _presentationInProgress = true;
+          try {
+            if (!valid() ||
+                WidgetsBinding.instance.lifecycleState !=
+                    AppLifecycleState.resumed ||
+                (rule['skipIfPremium'] == true && _subscriptionPremium)) {
+              return false;
+            }
+            if (explicit) {
+              final nextKey = rule['triggerKey'].toString();
+              if (!await closeSource()) return false;
+              final outcome = await _handleTrigger(
+                context,
+                triggerKey: nextKey,
+                presentationGuard: () =>
+                    flowValid() &&
+                    WidgetsBinding.instance.lifecycleState ==
+                        AppLifecycleState.resumed &&
+                    !(rule['skipIfPremium'] == true && _subscriptionPremium),
+                metadata: metadata,
+                followUpDepth: depth + 1,
+                followUpVisited: seen,
+                preventFollowUpRepeat: rule['preventRepeatPaywall'] != false,
+                onPurchase: onPurchase,
+                onRestore: onRestore,
+                onDismiss: onDismiss,
+                onOpenUrl: onOpenUrl,
+                onOpenTerms: onOpenTerms,
+                onOpenPrivacy: onOpenPrivacy,
               );
-              if (seen.contains(resolution.paywallId)) return;
+              return outcome.show;
+            } else {
+              if (!await closeSource()) return false;
+              if (!await _syncManifestInBackground(requireFresh: true)) {
+                return false;
+              }
+              if (!valid()) return false;
+              if (_manifestService?.manifest?.findTrigger(paywall.triggerKey) ==
+                  null) {
+                return false;
+              }
+              final resolvedLegacy =
+                  legacy ??
+                  _manifestService?.manifest
+                      ?.findTrigger(paywall.triggerKey)
+                      ?.dismissFollowUpPaywallId;
+              if (resolvedLegacy == null || seen.contains(resolvedLegacy)) {
+                return false;
+              }
+              final next = _manifestService?.manifest?.paywalls[resolvedLegacy];
+              if (next == null) return false;
+              final result = next.toPaywallResult(
+                triggerKey: paywall.triggerKey,
+                appKey: paywall.appKey,
+              );
+              final controller = await _prepareRouteController(result);
+              if (!valid()) {
+                controller.dispose();
+                return false;
+              }
+              _bindFollowUp(
+                context,
+                result.paywall!,
+                metadata: metadata,
+                depth: depth + 1,
+                visited: seen,
+                onPurchase: onPurchase,
+                onRestore: onRestore,
+                onDismiss: onDismiss,
+                onOpenUrl: onOpenUrl,
+                onOpenTerms: onOpenTerms,
+                onOpenPrivacy: onOpenPrivacy,
+              );
+              _presentRoutePaywall(
+                context,
+                triggerKey: paywall.triggerKey,
+                paywall: result.paywall!,
+                preparedController: controller,
+                disposeProvidedPreparedController: true,
+                onPurchase: onPurchase,
+                onRestore: onRestore,
+                onDismiss: onDismiss,
+                onOpenUrl: onOpenUrl,
+                onOpenTerms: onOpenTerms,
+                onOpenPrivacy: onOpenPrivacy,
+              );
+              return true;
             }
-            dismiss();
-            await Future<void>.delayed(const Duration(milliseconds: 350));
-            if (!valid()) return;
-            await _handleTrigger(
-              context,
-              triggerKey: nextKey,
-              metadata: metadata,
-              followUpDepth: depth + 1,
-              followUpVisited: seen,
-              preventFollowUpRepeat: rule['preventRepeatPaywall'] != false,
-              onPurchase: onPurchase,
-              onRestore: onRestore,
-              onDismiss: onDismiss,
-              onOpenUrl: onOpenUrl,
-              onOpenTerms: onOpenTerms,
-              onOpenPrivacy: onOpenPrivacy,
-            );
-          } else {
-            await Future<void>.delayed(const Duration(milliseconds: 350));
-            if (!valid()) return;
-            if (!await _syncManifestInBackground(requireFresh: true)) return;
-            if (!valid()) return;
-            if (_manifestService?.manifest?.findTrigger(paywall.triggerKey) ==
-                null)
-              return;
-            final resolvedLegacy =
-                legacy ??
-                _manifestService?.manifest
-                    ?.findTrigger(paywall.triggerKey)
-                    ?.dismissFollowUpPaywallId;
-            if (resolvedLegacy == null || seen.contains(resolvedLegacy)) return;
-            final next = _manifestService?.manifest?.paywalls[resolvedLegacy];
-            if (next == null) return;
-            final result = next.toPaywallResult(
-              triggerKey: paywall.triggerKey,
-              appKey: paywall.appKey,
-            );
-            final controller = await _prepareRouteController(result);
-            if (!valid()) {
-              controller.dispose();
-              return;
-            }
-            _bindFollowUp(
-              context,
-              result.paywall!,
-              metadata: metadata,
-              depth: depth + 1,
-              visited: seen,
-              onPurchase: onPurchase,
-              onRestore: onRestore,
-              onDismiss: onDismiss,
-              onOpenUrl: onOpenUrl,
-              onOpenTerms: onOpenTerms,
-              onOpenPrivacy: onOpenPrivacy,
-            );
-            _presentRoutePaywall(
-              context,
-              triggerKey: paywall.triggerKey,
-              paywall: result.paywall!,
-              preparedController: controller,
-              disposeProvidedPreparedController: true,
-              onPurchase: onPurchase,
-              onRestore: onRestore,
-              onDismiss: onDismiss,
-              onOpenUrl: onOpenUrl,
-              onOpenTerms: onOpenTerms,
-              onOpenPrivacy: onOpenPrivacy,
-            );
+          } finally {
+            _presentationInProgress = false;
           }
         },
       );
+      if (scheduled &&
+          (event == 'onPurchaseFailed' || event == 'onPurchaseCancelled')) {
+        _followUpOutcomePaywallId = paywall.id;
+      }
     };
   }
 
   /// Call only after the host billing provider confirms restored entitlement.
+  /// Confirms a real restore. A captured restore-button context takes precedence
+  /// over a reused callback's original source ID within the same active flow.
   void trackRestoreSuccess({required String paywallId}) {
     final paywall = _followUpPaywall;
-    if (paywall == null || paywall.id != paywallId) return;
-    _followUpEvent?.call('onRestore', paywallId);
+    if (paywall == null || _disposed) return;
+    final trackedRestore =
+        _restoreRequestGeneration == _flowGeneration &&
+        _restoreRequestPaywallId == paywall.id;
+    final resolvedId = trackedRestore ? _restoreRequestPaywallId : paywallId;
+    if (resolvedId != paywall.id) return;
+    _restoreRequestPaywallId = null;
+    _restoreRequestGeneration = null;
+    unawaited(_cancelPendingPurchasedOffers());
+    _followUpEvent?.call('onRestore', resolvedId);
     _trackDisplayedEvent('restore_success', paywall, paywall.triggerKey);
   }
 
@@ -2422,6 +3343,47 @@ class MySuperWallClient {
     PaywallData paywall,
     String triggerKey,
   ) {
+    final offer = _pendingOfferDisplay;
+    if (type == 'paywall_shown' &&
+        offer != null &&
+        offer['key'] == triggerKey &&
+        offer['scope'] == _cacheScope &&
+        offer['generation'] == _flowGeneration) {
+      _pendingOfferDisplay = null;
+      _reportLifecycleStatus(
+        triggerKey,
+        'shown',
+        'deferred_follow_up_displayed',
+      );
+      final id = offer['id'].toString();
+      final pendingStore = _pendingOffers;
+      if (pendingStore != null) {
+        unawaited(
+          pendingStore
+              .shown(id, offer['session'] as int, DateTime.now().toUtc())
+              .catchError((Object error) {
+                _logger.w(
+                  '[MySuperWall] Could not complete pending offer: $error',
+                );
+              }),
+        );
+      }
+      _pendingOfferCallbacks.remove(id);
+      _pendingOfferOwners.remove(id);
+    }
+    if (type == 'paywall_shown' &&
+        _pendingLifecycleTriggers.contains(triggerKey)) {
+      _reportLifecycleStatus(triggerKey, 'shown', 'display_callback');
+      _pendingLifecycleTriggers.remove(triggerKey);
+      _pendingLifecycleDates.remove(triggerKey);
+      unawaited(
+        _saveLifecycleQueue().catchError((Object error) {
+          _logger.w(
+            '[MySuperWall] Could not persist lifecycle completion: $error',
+          );
+        }),
+      );
+    }
     _eventQueue?.enqueue({
       'type': type,
       'userId': _userId,
@@ -2505,9 +3467,13 @@ class MySuperWallClient {
         'purchase': 'onPurchase',
         'purchase_success': 'onPurchase',
         'purchase_failed': 'onPurchaseFailed',
+        'purchase_cancelled': 'onPurchaseCancelled',
         'restore': 'onRestore',
         'restore_success': 'onRestore',
       }[eventType];
+      if (eventType == 'purchase_success') {
+        await _cancelPendingPurchasedOffers();
+      }
       if (followUpEvent != null) {
         _followUpEvent?.call(
           followUpEvent,
@@ -2526,6 +3492,7 @@ class MySuperWallClient {
         if (purchaseContext['experimentContext'] != null)
           'experimentContext': purchaseContext['experimentContext'],
         'userId': eventUserId,
+        'sdkCapabilities': ['deferred_follow_up_v1'],
         'productId': productId,
         if (purchaseContext['paywallId'] != null)
           'paywallId': purchaseContext['paywallId'],
@@ -2677,6 +3644,7 @@ class MySuperWallClient {
         if (Platform.isAndroid) 'packageName': appInfo.packageName,
         'type': 'paywall_dismissed',
         'userId': eventUserId,
+        'sdkCapabilities': ['deferred_follow_up_v1'],
         'paywallId': paywallId,
         'eventId': const Uuid().v4(),
         if (experimentContext != null) 'experimentContext': experimentContext,
@@ -2783,13 +3751,21 @@ class MySuperWallClient {
     try {
       final appInfo = await PackageInfo.fromPlatform();
       final offset = DateTime.now().timeZoneOffset.inMinutes;
-      final signature = jsonEncode([token, userId, _locale, appInfo.version, offset]);
+      final signature = jsonEncode([
+        token,
+        userId,
+        _locale,
+        appInfo.version,
+        offset,
+      ]);
       final now = DateTime.now().millisecondsSinceEpoch;
       if (!force) {
         final last = _prefs?.getString(_pushSyncKey);
         if (last != null) {
           final saved = jsonDecode(last) as Map<String, dynamic>;
-          if (saved['s'] == signature && now - (saved['t'] as int) < 86400000) return;
+          if (saved['s'] == signature && now - (saved['t'] as int) < 86400000) {
+            return;
+          }
         }
       }
       final response = await _httpClient
@@ -2810,7 +3786,10 @@ class MySuperWallClient {
           )
           .timeout(timeout);
       if (response.statusCode >= 200 && response.statusCode < 300) {
-        await _prefs?.setString(_pushSyncKey, jsonEncode({'s': signature, 't': now}));
+        await _prefs?.setString(
+          _pushSyncKey,
+          jsonEncode({'s': signature, 't': now}),
+        );
       }
     } catch (e) {
       _logger.e('[MySuperWall] Push token registration error: $e');
@@ -2898,12 +3877,26 @@ class MySuperWallClient {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _pendingOfferTimer?.cancel();
     _flowGeneration++;
+    _pendingOfferDisplay = null;
+    _pendingOfferCallbacks.clear();
+    _pendingOfferOwners.clear();
+
+    _restoreRequestPaywallId = null;
+    _restoreRequestGeneration = null;
     _followUps.reset();
     _followUpEvent = null;
     _followUpPaywall = null;
     _followUpOutcomePaywallId = null;
     _automationActionHandler = null;
+    _presentationHandlerOwner = null;
+    _presentationHandlersExplicit = false;
+    _presentationPurchase = null;
+    _presentationRestore = null;
+    _presentationOpenUrl = null;
+    _presentationOpenTerms = null;
+    _presentationOpenPrivacy = null;
     _eventQueue?.dispose();
     _eventQueue = null;
     if (identical(_instance, this)) {

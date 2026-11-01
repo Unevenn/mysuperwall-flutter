@@ -4,12 +4,16 @@ import 'dart:async';
 class FollowUpService {
   final Map<String, DateTime> _used = {};
   final Set<Timer> _timers = {};
+  final Set<String> _pending = {};
+  int _generation = 0;
 
   void cancel() {
+    _generation++;
     for (final timer in _timers) {
       timer.cancel();
     }
     _timers.clear();
+    _pending.clear();
   }
 
   void reset() {
@@ -22,7 +26,8 @@ class FollowUpService {
     required Map<String, dynamic> rule,
     required int depth,
     required bool premium,
-    required Future<void> Function() run,
+    required Future<bool> Function() run,
+    void Function(Object error)? onError,
   }) {
     int integer(String key, int fallback, int max) {
       final raw = rule[key];
@@ -33,7 +38,8 @@ class FollowUpService {
         (rule['actionType'] ?? 'trigger') != 'trigger' ||
         (rule['triggerKey']?.toString().trim().isEmpty ?? true) ||
         (rule['skipIfPremium'] == true && premium) ||
-        depth >= integer('maxChainDepth', 2, 5).clamp(1, 5)) {
+        depth >= integer('maxChainDepth', 2, 5).clamp(1, 5) ||
+        _pending.contains(key)) {
       return false;
     }
     final now = DateTime.now();
@@ -44,12 +50,23 @@ class FollowUpService {
                 integer('cooldownMs', 0, 86400000))) {
       return false;
     }
-    _used[key] = now;
+    _pending.add(key);
+    final generation = _generation;
     late final Timer timer;
-    timer = Timer(Duration(milliseconds: integer('delayMs', 0, 10000)), () {
+    timer = Timer(Duration(milliseconds: integer('delayMs', 0, 10000)), () async {
       _timers.remove(timer);
-      // Recovery failure must not break the customer's current screen.
-      unawaited(run().catchError((Object _) {}));
+      try {
+        // A cancelled, unmatched or failed attempt must not consume a session rule.
+        if (generation == _generation &&
+            await run() &&
+            generation == _generation) {
+          _used[key] = DateTime.now();
+        }
+      } catch (error) {
+        onError?.call(error);
+      } finally {
+        if (generation == _generation) _pending.remove(key);
+      }
     });
     _timers.add(timer);
     return true;

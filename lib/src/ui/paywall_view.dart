@@ -13,6 +13,7 @@ import '../mysuperwall_client.dart';
 import 'android_paywall_back_bridge.dart';
 import 'edge_swipe_dismiss_overlay.dart';
 import 'paywall_session.dart';
+import 'paywall_motion.dart';
 
 class PaywallView extends StatefulWidget {
   static VoidCallback? _currentDismiss;
@@ -29,6 +30,7 @@ class PaywallView extends StatefulWidget {
   final PreparedPaywallController? preparedController;
 
   final bool disposeProvidedPreparedController;
+  final bool trackDismissInternally;
 
   const PaywallView({
     super.key,
@@ -42,6 +44,7 @@ class PaywallView extends StatefulWidget {
     this.onOpenPrivacy,
     this.preparedController,
     this.disposeProvidedPreparedController = false,
+    this.trackDismissInternally = true,
   });
 
   @override
@@ -49,7 +52,6 @@ class PaywallView extends StatefulWidget {
 
   static void dismissCurrent() {
     _currentDismiss?.call();
-    _currentDismiss = null;
   }
 
   static Future<void> show(
@@ -64,6 +66,7 @@ class PaywallView extends StatefulWidget {
     ValueChanged<String?>? onOpenPrivacy,
     PreparedPaywallController? preparedController,
     bool disposeProvidedPreparedController = false,
+    bool trackDismissInternally = true,
   }) async {
     dismissCurrent();
 
@@ -78,19 +81,34 @@ class PaywallView extends StatefulWidget {
       onOpenPrivacy: onOpenPrivacy,
       preparedController: preparedController,
       disposeProvidedPreparedController: disposeProvidedPreparedController,
+      trackDismissInternally: trackDismissInternally,
     );
 
-    final route = _buildRoute(paywall.presentation, routeBuilder);
+    final reducedMotion =
+        MediaQuery.maybeOf(context)?.disableAnimations ?? false;
+    final effectivePresentation = reducedMotion
+        ? const PaywallPresentationConfig(style: PaywallPresentationStyle.none)
+        : paywall.presentation;
+    final route = _buildRoute(effectivePresentation, routeBuilder);
 
+    var closing = false;
     void dismissRoute() {
-      if (route.isActive && context.mounted) {
-        Navigator.of(context).removeRoute(route);
+      if (closing) return;
+      closing = true;
+      if (route.animation?.status == AnimationStatus.reverse) return;
+      final navigator = route.navigator;
+      if (route.isActive && navigator != null) {
+        if (route.isCurrent) {
+          navigator.pop();
+        } else {
+          navigator.removeRoute(route);
+        }
       }
     }
 
     _currentDismiss = dismissRoute;
 
-    route.popped.then((_) {
+    route.completed.then((_) {
       if (identical(_currentDismiss, dismissRoute)) {
         _currentDismiss = null;
       }
@@ -99,7 +117,7 @@ class PaywallView extends StatefulWidget {
     await Navigator.of(context).push(route);
   }
 
-  static Route<void> _buildRoute(
+  static PageRoute<void> _buildRoute(
     PaywallPresentationConfig presentation,
     WidgetBuilder routeBuilder,
   ) {
@@ -123,56 +141,12 @@ class PaywallView extends StatefulWidget {
       reverseTransitionDuration: transitionDuration,
       pageBuilder: (context, animation, secondaryAnimation) =>
           routeBuilder(context),
-      transitionsBuilder: (context, animation, secondaryAnimation, child) {
-        switch (presentation.style) {
-          case PaywallPresentationStyle.slideUp:
-            return SlideTransition(
-              position:
-                  Tween<Offset>(
-                    begin: const Offset(0, 1),
-                    end: Offset.zero,
-                  ).animate(
-                    CurvedAnimation(
-                      parent: animation,
-                      curve: presentation.curve,
-                    ),
-                  ),
-              child: child,
-            );
-          case PaywallPresentationStyle.slideDown:
-            return SlideTransition(
-              position:
-                  Tween<Offset>(
-                    begin: const Offset(0, -0.12),
-                    end: Offset.zero,
-                  ).animate(
-                    CurvedAnimation(
-                      parent: animation,
-                      curve: presentation.curve,
-                    ),
-                  ),
-              child: child,
-            );
-          case PaywallPresentationStyle.slideLeft:
-            return SlideTransition(
-              position:
-                  Tween<Offset>(
-                    begin: const Offset(0.12, 0),
-                    end: Offset.zero,
-                  ).animate(
-                    CurvedAnimation(
-                      parent: animation,
-                      curve: presentation.curve,
-                    ),
-                  ),
-              child: child,
-            );
-          case PaywallPresentationStyle.none:
-            return child;
-          case PaywallPresentationStyle.system:
-            return child;
-        }
-      },
+      transitionsBuilder: (context, animation, secondaryAnimation, child) =>
+          PaywallMotion(
+            presentation: presentation,
+            animation: animation,
+            child: child,
+          ),
     );
   }
 }
@@ -200,6 +174,10 @@ class _PaywallViewState extends State<PaywallView> {
           valueListenable: _preparedController.isLoading,
           builder: (context, isLoading, _) {
             return Stack(
+              // On Android the edge-swipe layer is a SizedBox.shrink().
+              // Positioned children do not size a Stack, so a loose fit can
+              // otherwise collapse the entire WebView surface to zero size.
+              fit: StackFit.expand,
               children: [
                 Positioned.fill(
                   child: Stack(
@@ -363,13 +341,15 @@ class _PaywallViewState extends State<PaywallView> {
     final visibleDuration =
         durationInSeconds ?? _preparedController.activeDurationInSeconds;
     _preparedController.deactivate();
-    if (MySuperWallClient.isInitialized)
+    if (widget.trackDismissInternally && MySuperWallClient.isInitialized) {
       MySuperWallClient.instance.trackDismiss(
         paywallId: widget.paywall.id,
         triggerKey: widget.paywall.triggerKey,
         duration: visibleDuration,
         abVariant: widget.paywall.abVariant,
+        experimentContext: widget.paywall.experimentContext,
       );
+    }
 
     if (popRoute && mounted) {
       Navigator.of(context).pop();

@@ -85,6 +85,7 @@ class ManifestService {
       final currentHash = _currentManifest?.hash;
 
       final body = <String, dynamic>{
+        'sdkCapabilities': ['deferred_follow_up_v1'],
         if (appKey != null && appKey.isNotEmpty) 'appKey': appKey,
         if (bundleId != null && bundleId.isNotEmpty) 'bundleId': bundleId,
         if (packageName != null && packageName.isNotEmpty)

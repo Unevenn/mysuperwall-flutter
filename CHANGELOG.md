@@ -1,3 +1,13 @@
+## 1.4.0 — 2026-11-01
+
+- Add automatic lifecycle history, configurable session/day/active-minute thresholds,
+  host readiness and 30-day pending signals with visibility-based completion.
+- Add durable delayed follow-ups, source-policy revalidation and separate cancellation outcomes.
+- Fix prepared-host sizing, follow-up binding, dismissal attribution and presentation concurrency.
+- Add smooth motion styles, reverse transitions, reduced motion and instant open/close.
+- Expected lifecycle no-display decisions remain diagnostic rather than error logs.
+- Update lifecycle, billing and integration documentation. No Flutter build/run/tests performed.
+
 ## 1.3.1 - 2026-10-30
 
 - Revalidate trigger delivery with the backend before showing, including prepared presentation; discard cached/prepared content on a no-display decision. Cached HTML is no longer authorization to display offline. Network failures do not deliver stale paywalls.

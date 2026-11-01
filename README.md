@@ -1,3 +1,5 @@
+> **1.4.0 (2026-11-01):** Lifecycle history, deferred follow-up offers and expanded motion. Use this version for the new APIs below. Existing billing remains app-owned. Device billing and motion verification are not implied by publication.
+
 > **1.3.1 delivery behavior (2026-10-30):** The Flutter SDK validates delivery with the server before every presentation, including prepared views. Disabled triggers/paywalls and holdout decisions must not open a native/default fallback. Cached content is not shown on network failure. Hidden prepared views detach after loading; animations and media pause while hidden/backgrounded. Keep `MySuperWallHost`. Prewarming avoids HTML loading work, but a network decision is still required. Dashboard changes take effect on the next delivery request, not by closing an already-open screen.
 
 [![MySuperWall — Make it beautiful. Make it live.](https://mysuperwall.com/assets/sdk/flutter-readme-hero-v1.png)](https://mysuperwall.com)
@@ -43,7 +45,7 @@ Design in MySuperWall. Publish remotely. Show the right paywall in your app — 
 
 ```yaml
 dependencies:
-  mysuperwall_sdk: ^1.3.1
+  mysuperwall_sdk: ^1.4.0
 ```
 
 Requires **Flutter 3.35+ / Dart 3.9+**. Supports **iOS and Android**.
@@ -194,7 +196,7 @@ An anonymous user ID is generated when omitted during initialization. Language a
 <details>
 <summary><strong>Recovery paywalls &amp; restore completion</strong></summary>
 
-`handleTrigger` runs configured follow-up rules with once-per-session, cooldown, chain-depth and repeat protection. In 1.3.1, a legacy dismiss second screen requires a freshly validated manifest; a cached target alone is insufficient.
+`handleTrigger` runs configured follow-up rules with once-per-session, cooldown, chain-depth and repeat protection. The 1.4.0 update also binds these rules in `presentPreparedPaywallIfAvailable`, using a mounted `MySuperWallHost` context when no presentation context is supplied. In 1.3.1, a legacy dismiss second screen requires a freshly validated manifest; a cached target alone is insufficient.
 
 Pass real entitlement state through `setSubscriptionStatus(bool)` for rules using `skipIfPremium`. After a confirmed restore:
 
@@ -203,6 +205,8 @@ MySuperWallClient.instance.trackRestoreSuccess(
   paywallId: displayedPaywallId,
 );
 ```
+
+Report actual billing outcomes: call `trackPurchaseCancelled` for user cancellation, `trackPurchaseFailed` for errors, and `trackPurchaseSuccess` for confirmed success. A generic failure cannot be interpreted as a cancellation. When callbacks are reused by a follow-up, omit optional purchase `paywallId`/`triggerKey` overrides unless they identify the currently displayed paywall; the SDK records the purchase context on the button tap. Hardcoding the first paywall's IDs attributes later outcomes to the wrong screen. Cooldown is a minimum interval between successful follow-up attempts; it is not added to the first attempt's delay.
 
 Purchase success rules follow host-confirmed completion calls. Existing `setAutomationActionHandler` integrations take precedence over the default runner, preventing double presentation.
 
@@ -218,6 +222,19 @@ Built-in lifecycle triggers include:
 - `mysuperwall.install`, `mysuperwall.update`, `mysuperwall.session`
 - `mysuperwall.session_3/5/10/20/50`
 - `mysuperwall.day_1/3/7/14/30`
+
+Automatic lifecycle presentation reuses the purchase, restore and link handlers supplied to `handleTrigger` or `presentPreparedPaywallIfAvailable`. Manual presentation semantics are unchanged: omitted callbacks remain omitted. For automatic presentation, a bundle inferred from a manual call is usable only while its supplied context remains mounted; prepared calls without a context cannot register a safe owner. Explicit `setPresentationHandlers` registers app-level service/controller handlers, takes precedence over inferred callbacks, and remains valid until SDK disposal or replacement. The host only controls display readiness:
+
+```dart
+MySuperWallHost(
+  lifecycleReady: onboardingComplete,
+  child: child ?? const SizedBox.shrink(),
+)
+```
+
+If an automatic lifecycle paywall must appear before any manual presentation has registered billing handlers, register the existing application handlers once with `client.setPresentationHandlers(onPurchase: buy, onRestore: restorePurchases)`. Automatic display waits until a purchase handler is available; no billing callbacks are required on the host. Dismiss callbacks remain specific to each manual presentation. The SDK supports `mysuperwall.foreground` and configurable `mysuperwall.session_N`, `mysuperwall.day_N`, and `mysuperwall.active_minutes_N` keys. Active minutes exclude background time. A new session is counted on SDK initialization and on a foreground return after at least 30 minutes in the background. Days are measured from the SDK's first initialization.
+
+Call `handleLifecycleTriggers(context, onPurchase: ..., onRestore: ...)` after the UI is ready to evaluate these events manually. One-time events are retained for up to 30 days until a matching paywall is presented; the recurring session event is evaluated for the current initialization. Session/active-time checkpoints retain 30 days plus a baseline. Custom rules created later use the recorded crossing date, rather than the rule creation date. Continuous active intervals are compacted; active-time crossing dates are interpolated within the recorded interval (checkpoint resolution is normally one minute). Crossings before history collection began cannot be recovered and are reported as `historical_timestamp_unavailable`; no synthetic date is assigned. Debugger lifecycle events distinguish received, pending, matched, shown, rejected and expired states.
 
 Fetching or preparing a paywall is separate from displaying it. Analytics reflects SDK-reported activity; it is not independent proof of screen visibility or a store transaction.
 
@@ -383,3 +400,55 @@ States are `idle`, `loading`, `ready`, `presenting`, `visible`, `dismissed`, and
 transition finishes and the WebView reports paint readiness, while the paywall
 is active and the app is in the foreground. A readiness timeout alone does not
 count as an impression. This does not delay the opening animation.
+
+### Deferred follow-up offers (local, unreleased source)
+
+The Follow-up tab supports elapsed minutes, additional active-use minutes, next
+session and next foreground return relative to the source event. Eligibility can
+exclude the first session and require minimum sessions/days. Offers persist per
+app/user for their configured validity (default 1,440 minutes), with per-rule UTC
+daily limits and cancellation after confirmed purchase/restore. They never open
+UI while the app is backgrounded or another paywall/billing overlay is active.
+The host evaluates eligible offers at foreground readiness and approximately
+every 15 seconds while active. Reliable restart presentation requires explicit
+application-service billing handlers. Old SDKs skip advanced rules because only
+updated source advertises `deferred_follow_up_v1`; included in 1.4.0.
+See the [scheduling contract](https://mysuperwall.com/docs/flutter-lifecycle-and-recovery.md).
+
+## Native presentation animation
+
+Custom slide styles use the configured duration (0–4,000 ms) and curve on entry
+and exit in the updated Flutter source. System mode uses platform/SDK defaults;
+None has no transition, so the editor disables duration/curve for those modes.
+Reduced-motion settings suppress SDK transitions. The updated prepared path
+reverses its animation before detaching; programmatic route dismissal uses pop
+and waits for the reverse transition before permitting another presentation.
+Kapatılabilir / dismissable controls user back/edge gestures; the paywall's own
+close button and explicit application dismiss calls can still close it. The
+prepared back-interceptor respects the same policy. Dismiss analytics are emitted
+once per route close in the SDK wrapper. These SDK corrections remain local and
+unpublished; code analysis is not device animation verification.
+
+## Additional motion styles (Flutter 1.4.0 source)
+
+Custom styles now share one `PaywallMotion` implementation across prepared and
+route presentation; the WebView is retained as a stable child. No blur, screenshots,
+HTML animation injection or repeated view creation is used for SDK transitions.
+
+| Editor style | Wire value | Recommended entry/exit duration |
+| --- | --- | --- |
+| Soft Rise | `fade_slide_up` | 340 ms |
+| Soft Fade | `fade` | 220 ms |
+| Scale In | `scale_up` | 320 ms |
+| Scale Settle | `scale_down` | 300 ms |
+| Slide From Left | `from_left` | 300 ms |
+
+New choices select the `smooth` cubic curve (0.22, 1, 0.36, 1) and the recommended
+duration. Existing paywall configurations are not automatically changed. An
+additional `easeInOutCubic` curve is available for balanced motion. Scale changes
+are deliberately small (0.96→1 and 1.035→1); Soft Rise moves 24 logical pixels and
+fades. Opacity is clamped even for overshooting legacy curves. Existing slide
+aliases remain backward compatible. Unknown effects fall back to System in older
+SDKs; they do not implement the new effects. System still uses platform/SDK defaults,
+None has no animation, and reduced-motion preferences disable SDK transitions.
+Native-device smoothness and frame timing have not been verified in this change.

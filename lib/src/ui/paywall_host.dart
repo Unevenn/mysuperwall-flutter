@@ -10,11 +10,19 @@ import '../models/paywall_presentation.dart';
 import 'android_paywall_back_bridge.dart';
 import 'edge_swipe_dismiss_overlay.dart';
 import 'paywall_session.dart';
+import 'paywall_motion.dart';
 
 class MySuperWallHost extends StatefulWidget {
   final Widget child;
 
-  const MySuperWallHost({super.key, required this.child});
+  /// Disable automatic presentation until the app is ready (for example after onboarding).
+  final bool lifecycleReady;
+
+  const MySuperWallHost({
+    super.key,
+    required this.child,
+    this.lifecycleReady = true,
+  });
 
   @override
   State<MySuperWallHost> createState() => _MySuperWallHostState();
@@ -54,22 +62,127 @@ class _HostLoadingOverlay extends StatelessWidget {
 Offset preparedPaywallBeginFractionalOffset(
   PaywallPresentationConfig presentation,
 ) {
-  switch (presentation.style) {
-    case PaywallPresentationStyle.slideLeft:
-      return const Offset(0.12, 0);
-    case PaywallPresentationStyle.system:
-    case PaywallPresentationStyle.slideUp:
-      return const Offset(0, 1);
-    case PaywallPresentationStyle.slideDown:
-      return const Offset(0, -0.12);
-    case PaywallPresentationStyle.none:
-      return Offset.zero;
-  }
+  return PaywallMotion.beginFraction(presentation.style);
 }
 
 class _MySuperWallHostState extends State<MySuperWallHost>
     with WidgetsBindingObserver {
   static bool _hasLoggedMounted = false;
+  static _MySuperWallHostState? _lifecycleOwner;
+  Timer? _lifecycleTimer;
+  bool _lifecycleRunning = false;
+
+  BuildContext? _navigatorContext() {
+    BuildContext? found;
+    void visit(Element element) {
+      if (found != null) return;
+      if (element is StatefulElement && element.state is NavigatorState) {
+        // Navigator.of must receive a descendant, not the Navigator element itself.
+        found = (element.state as NavigatorState).overlay?.context;
+        return;
+      }
+      element.visitChildren(visit);
+    }
+
+    (context as Element).visitChildren(visit);
+    return found ?? Navigator.maybeOf(context)?.overlay?.context;
+  }
+
+  Future<void> _runLifecycle({bool refreshSignals = true}) async {
+    if (!mounted ||
+        !MySuperWallClient.isInitialized ||
+        _lifecycleRunning ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    _lifecycleOwner ??= this;
+    if (!identical(_lifecycleOwner, this)) return;
+    _lifecycleRunning = true;
+    try {
+      if (refreshSignals) {
+        await MySuperWallClient.instance.updateLifecycleSignals();
+      }
+      if (!mounted) return;
+      final client = MySuperWallClient.instance;
+      if (!widget.lifecycleReady ||
+          WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+        client.reportLifecycleWaiting(
+          !widget.lifecycleReady
+              ? 'app_not_ready'
+              : !client.hasPresentationHandlers
+              ? 'billing_handlers_unavailable'
+              : 'app_backgrounded',
+        );
+        return;
+      }
+      final navigatorContext = _navigatorContext();
+      if (navigatorContext == null || !navigatorContext.mounted) return;
+      bool ready() =>
+          mounted &&
+          widget.lifecycleReady &&
+          MySuperWallClient.isInitialized &&
+          identical(MySuperWallClient.instance, client) &&
+          WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+      if (await client.handlePendingFollowUps(
+        navigatorContext,
+        canPresent: ready,
+      )) {
+        return;
+      }
+      if (!client.hasPresentationHandlers) {
+        client.reportLifecycleWaiting('billing_handlers_unavailable');
+        return;
+      }
+      await client.handleLifecycleTriggers(
+        navigatorContext,
+        canPresent: () =>
+            mounted &&
+            widget.lifecycleReady &&
+            MySuperWallClient.isInitialized &&
+            identical(MySuperWallClient.instance, client) &&
+            client.hasPresentationHandlers &&
+            WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed,
+      );
+    } catch (error) {
+      _logger.w('[MySuperWall] Lifecycle processing failed: $error');
+    } finally {
+      _lifecycleRunning = false;
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant MySuperWallHost oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.lifecycleReady && !oldWidget.lifecycleReady) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => unawaited(_runLifecycle()),
+      );
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    unawaited(_updateLifecycleState(state));
+  }
+
+  Future<void> _updateLifecycleState(AppLifecycleState state) async {
+    if (!mounted || !MySuperWallClient.isInitialized) return;
+    _lifecycleOwner ??= this;
+    if (!identical(_lifecycleOwner, this)) return;
+    final client = MySuperWallClient.instance;
+    try {
+      if (state == AppLifecycleState.resumed) {
+        await client.updateLifecycleSignals(foreground: true);
+        if (mounted) await _runLifecycle(refreshSignals: false);
+      } else if (state == AppLifecycleState.paused ||
+          state == AppLifecycleState.hidden) {
+        await client.updateLifecycleSignals(background: true);
+      }
+    } catch (error) {
+      _logger.w('[MySuperWall] Lifecycle state update failed: $error');
+    }
+  }
+
   static final Logger _logger = MySuperWallLogging.createLogger(
     printer: PrettyPrinter(
       methodCount: 0,
@@ -185,6 +298,20 @@ class _MySuperWallHostState extends State<MySuperWallHost>
 
   @override
   void dispose() {
+    _lifecycleTimer?.cancel();
+    MySuperWallClient.registerHostContextProvider(this, null);
+    if (identical(_lifecycleOwner, this) && MySuperWallClient.isInitialized) {
+      unawaited(
+        MySuperWallClient.instance
+            .updateLifecycleSignals(background: true)
+            .catchError((Object error) {
+              _logger.w(
+                '[MySuperWall] Could not close lifecycle interval: $error',
+              );
+            }),
+      );
+    }
+    if (identical(_lifecycleOwner, this)) _lifecycleOwner = null;
     MySuperWallClient.activePreparedTriggerKeyListenable.removeListener(
       _handlePreparedPaywallVisibilityChanged,
     );
@@ -205,6 +332,18 @@ class _MySuperWallHostState extends State<MySuperWallHost>
     );
     WidgetsBinding.instance.addObserver(this);
     MySuperWallClient.registerHostMounted(true);
+    MySuperWallClient.registerHostContextProvider(
+      this,
+      () => mounted && widget.lifecycleReady ? _navigatorContext() : null,
+    );
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => unawaited(_runLifecycle()),
+    );
+    _lifecycleTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+        unawaited(_runLifecycle());
+      }
+    });
     MySuperWallClient.activePreparedTriggerKeyListenable.addListener(
       _handlePreparedPaywallVisibilityChanged,
     );
@@ -262,6 +401,29 @@ class _PreparedLayerState extends State<_PreparedLayer>
   bool _isPreparingPresentation = false;
   int _animationRequest = 0;
   int _lastPresentationSession = 0;
+  bool _isDismissing = false;
+
+  Future<void> _animateDismiss() async {
+    if (!mounted || !widget.isActive || _isDismissing) return;
+    setState(() {
+      _isDismissing = true;
+    });
+    try {
+      if (widget.controller.paywall.presentation.style ==
+              PaywallPresentationStyle.none ||
+          WidgetsBinding
+              .instance
+              .platformDispatcher
+              .accessibilityFeatures
+              .disableAnimations) {
+        _transitionController.value = 0;
+      } else {
+        await _transitionController.reverse().orCancel;
+      }
+    } on TickerCanceled {
+      // Host removal/replacement cancels its transition safely.
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -312,43 +474,15 @@ class _PreparedLayerState extends State<_PreparedLayer>
     );
 
     return ExcludeSemantics(
-      excluding: !widget.isActive || _isPreparingPresentation,
+      excluding: !widget.isActive || _isPreparingPresentation || _isDismissing,
       child: IgnorePointer(
-        ignoring: !widget.isActive || _isPreparingPresentation,
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            return AnimatedBuilder(
-              animation: _transitionController,
-              child: paywallContent,
-              builder: (context, child) {
-                final curve = _dragOffset > 0
-                    ? Curves.linear
-                    : _buildCurve(presentation);
-                final value = curve.transform(_transitionController.value);
-                final fractionalOffset = Offset.lerp(
-                  _buildFractionalBeginOffset(presentation),
-                  Offset.zero,
-                  value,
-                )!;
-                final translatedOffset = Offset(
-                  (fractionalOffset.dx * constraints.maxWidth) + _dragOffset,
-                  fractionalOffset.dy * constraints.maxHeight,
-                );
-
-                return Opacity(
-                  opacity: !widget.isActive || _isPreparingPresentation
-                      ? 0.001
-                      : _buildOpacity(presentation, value),
-                  child: Transform.translate(
-                    offset: !widget.isActive || _isPreparingPresentation
-                        ? Offset.zero
-                        : translatedOffset,
-                    child: child,
-                  ),
-                );
-              },
-            );
-          },
+        ignoring: !widget.isActive || _isPreparingPresentation || _isDismissing,
+        child: PaywallMotion(
+          presentation: presentation,
+          animation: _transitionController,
+          dragOffset: _dragOffset,
+          hidden: !widget.isActive || _isPreparingPresentation,
+          child: paywallContent,
         ),
       ),
     );
@@ -381,6 +515,7 @@ class _PreparedLayerState extends State<_PreparedLayer>
   @override
   void dispose() {
     _animationRequest++;
+    widget.controller.animateDismiss = null;
     _transitionController.dispose();
     super.dispose();
   }
@@ -394,6 +529,7 @@ class _PreparedLayerState extends State<_PreparedLayer>
       value: widget.isActive ? 0 : 1,
       duration: _buildDuration(widget.controller.paywall.presentation),
     );
+    widget.controller.animateDismiss = _animateDismiss;
     _transitionController.addStatusListener(_handleAnimationStatus);
     if (widget.isActive) {
       _startPresentationAnimation();
@@ -403,18 +539,30 @@ class _PreparedLayerState extends State<_PreparedLayer>
   void _handleAnimationStatus(AnimationStatus status) {
     if (status == AnimationStatus.completed &&
         widget.isActive &&
-        !_isPreparingPresentation) {
+        !_isPreparingPresentation &&
+        !_isDismissing) {
       widget.controller.presentationCompleted(
         isVisible: () =>
-            mounted && widget.isActive && !_isPreparingPresentation,
+            mounted &&
+            widget.isActive &&
+            !_isPreparingPresentation &&
+            !_isDismissing,
       );
     }
   }
 
   void _startPresentationAnimation({bool waitForMount = true}) {
     final request = ++_animationRequest;
+    _isDismissing = false;
     final presentation = widget.controller.paywall.presentation;
-    final duration = _buildDuration(presentation);
+    final duration =
+        WidgetsBinding
+            .instance
+            .platformDispatcher
+            .accessibilityFeatures
+            .disableAnimations
+        ? Duration.zero
+        : _buildDuration(presentation);
     _lastPresentationSession = widget.controller.presentationSession;
     _transitionController.duration = duration;
     _dragOffset = 0;
@@ -424,7 +572,10 @@ class _PreparedLayerState extends State<_PreparedLayer>
       _transitionController.value = 1;
       widget.controller.presentationCompleted(
         isVisible: () =>
-            mounted && widget.isActive && !_isPreparingPresentation,
+            mounted &&
+            widget.isActive &&
+            !_isPreparingPresentation &&
+            !_isDismissing,
       );
       return;
     }
@@ -451,54 +602,13 @@ class _PreparedLayerState extends State<_PreparedLayer>
     _transitionController.forward(from: 0);
   }
 
-  Offset _buildFractionalBeginOffset(PaywallPresentationConfig presentation) {
-    return preparedPaywallBeginFractionalOffset(presentation);
-  }
-
-  double _buildOpacity(
-    PaywallPresentationConfig presentation,
-    double progress,
-  ) {
-    switch (presentation.style) {
-      case PaywallPresentationStyle.slideLeft:
-      case PaywallPresentationStyle.system:
-      case PaywallPresentationStyle.slideUp:
-      case PaywallPresentationStyle.slideDown:
-        return (0.92 + (0.08 * progress)).clamp(0, 1);
-      case PaywallPresentationStyle.none:
-        return 1;
-    }
-  }
-
-  Curve _buildCurve(PaywallPresentationConfig presentation) {
-    if (!widget.isActive) {
-      return Curves.easeInCubic;
-    }
-
-    switch (presentation.style) {
-      case PaywallPresentationStyle.none:
-        return Curves.linear;
-      case PaywallPresentationStyle.system:
-      case PaywallPresentationStyle.slideLeft:
-      case PaywallPresentationStyle.slideUp:
-      case PaywallPresentationStyle.slideDown:
-        return presentation.curve;
-    }
-  }
-
   Duration _buildDuration(PaywallPresentationConfig presentation) {
-    if (!widget.isActive) {
-      return const Duration(milliseconds: 140);
+    if (presentation.style == PaywallPresentationStyle.none) {
+      return Duration.zero;
     }
-
-    switch (presentation.style) {
-      case PaywallPresentationStyle.none:
-        return Duration.zero;
-      case PaywallPresentationStyle.system:
-      case PaywallPresentationStyle.slideLeft:
-      case PaywallPresentationStyle.slideUp:
-      case PaywallPresentationStyle.slideDown:
-        return presentation.duration;
+    if (presentation.style == PaywallPresentationStyle.system) {
+      return PaywallPresentationConfig.defaults.duration;
     }
+    return presentation.duration;
   }
 }

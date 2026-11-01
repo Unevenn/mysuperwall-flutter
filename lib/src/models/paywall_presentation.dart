@@ -1,6 +1,17 @@
 import 'package:flutter/material.dart';
 
-enum PaywallPresentationStyle { system, slideLeft, slideUp, slideDown, none }
+enum PaywallPresentationStyle {
+  system,
+  slideLeft,
+  slideUp,
+  slideDown,
+  none,
+  fade,
+  scaleUp,
+  scaleDown,
+  fadeSlideUp,
+  slideFromLeft,
+}
 
 enum PaywallDismissStyle { system, swipeRight, none }
 
@@ -67,6 +78,13 @@ class PaywallPresentationConfig {
         return const Offset(0, 36);
       case PaywallPresentationStyle.slideDown:
         return const Offset(0, -36);
+      case PaywallPresentationStyle.slideFromLeft:
+        return const Offset(-28, 0);
+      case PaywallPresentationStyle.fadeSlideUp:
+        return const Offset(0, 24);
+      case PaywallPresentationStyle.fade:
+      case PaywallPresentationStyle.scaleUp:
+      case PaywallPresentationStyle.scaleDown:
       case PaywallPresentationStyle.none:
       case PaywallPresentationStyle.system:
         return Offset.zero;
@@ -83,6 +101,10 @@ class PaywallPresentationConfig {
 
   static Curve _parseCurve(String? raw) {
     switch (raw?.trim().toLowerCase()) {
+      case 'smooth':
+        return const Cubic(.22, 1, .36, 1);
+      case 'easeinoutcubic':
+        return Curves.easeInOutCubic;
       case 'easeout':
         return Curves.easeOut;
       case 'easeinout':
@@ -132,6 +154,17 @@ class PaywallPresentationConfig {
     final compact = normalized.replaceAll('_', '');
 
     switch (normalized) {
+      case 'fade':
+        return PaywallPresentationStyle.fade;
+      case 'scale_up':
+        return PaywallPresentationStyle.scaleUp;
+      case 'scale_down':
+        return PaywallPresentationStyle.scaleDown;
+      case 'fade_slide_up':
+        return PaywallPresentationStyle.fadeSlideUp;
+      case 'from_left':
+        return PaywallPresentationStyle.slideFromLeft;
+
       case 'slide_left':
       case 'right_to_left':
       case 'slide_right':
@@ -160,6 +193,16 @@ class PaywallPresentationConfig {
     }
 
     switch (compact) {
+      case 'scaleup':
+        return PaywallPresentationStyle.scaleUp;
+      case 'scaledown':
+        return PaywallPresentationStyle.scaleDown;
+      case 'fadeslideup':
+        return PaywallPresentationStyle.fadeSlideUp;
+      case 'fromleft':
+      case 'slidefromleft':
+        return PaywallPresentationStyle.slideFromLeft;
+
       case 'slideleft':
       case 'righttoleft':
       case 'slideright':
