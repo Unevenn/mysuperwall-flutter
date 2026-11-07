@@ -190,7 +190,26 @@ class ManifestTrigger {
     required this.variants,
     required this.rules,
     this.dismissFollowUpPaywallId,
+    this.fromOpen = 1,
+    this.delaySeconds = 0,
+    this.maxPerUser = 0,
+    this.minIntervalHours = 0,
+    this.maxPerPeriod = 0,
+    this.periodDays = 1,
+    this.stopAfterDismissals = 0,
+    this.hideForPurchasers = false,
   });
+
+  /// Lifecycle schedule and display limits. Older manifests omit them; the
+  /// defaults here never block, and the server keeps enforcing either way.
+  final int fromOpen;
+  final int delaySeconds;
+  final int maxPerUser;
+  final int minIntervalHours;
+  final int maxPerPeriod;
+  final int periodDays;
+  final int stopAfterDismissals;
+  final bool hideForPurchasers;
 
   final String id;
   final String key;
@@ -212,8 +231,20 @@ class ManifestTrigger {
         dismissAction['type'] == 'follow_up_paywall') {
       followUpId = dismissAction['followUpPaywallId']?.toString();
     }
+    final schedule = json['schedule'] is Map ? json['schedule'] as Map : const {};
+    final limit = json['displayLimit'] is Map ? json['displayLimit'] as Map : const {};
+    int number(Map source, String field, int fallback) =>
+        source[field] is num ? (source[field] as num).toInt() : fallback;
 
     return ManifestTrigger(
+      fromOpen: number(schedule, 'fromOpen', 1),
+      delaySeconds: number(schedule, 'delaySeconds', 0),
+      maxPerUser: number(limit, 'maxPerUser', 0),
+      minIntervalHours: number(limit, 'minIntervalHours', 0),
+      maxPerPeriod: number(limit, 'maxPerPeriod', 0),
+      periodDays: limit['period'] == 'week' ? 7 : 1,
+      stopAfterDismissals: number(limit, 'stopAfterDismissals', 0),
+      hideForPurchasers: limit['hideForPurchasers'] == true,
       experimentId: json['experimentId']?.toString(),
       experimentVersion: json['experimentVersion']?.toString(),
       audienceId: json['audienceId']?.toString(),
@@ -239,6 +270,15 @@ class ManifestTrigger {
   }
 
   Map<String, dynamic> toJson() => {
+    'schedule': {'fromOpen': fromOpen, 'delaySeconds': delaySeconds},
+    'displayLimit': {
+      'maxPerUser': maxPerUser,
+      'minIntervalHours': minIntervalHours,
+      'maxPerPeriod': maxPerPeriod,
+      'period': periodDays == 7 ? 'week' : 'day',
+      'stopAfterDismissals': stopAfterDismissals,
+      'hideForPurchasers': hideForPurchasers,
+    },
     'experimentId': experimentId,
     'experimentVersion': experimentVersion,
     'audienceId': audienceId,

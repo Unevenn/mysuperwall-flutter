@@ -1,6 +1,6 @@
-> **1.4.0 (2026-11-01):** Lifecycle history, deferred follow-up offers and expanded motion. Use this version for the new APIs below. Existing billing remains app-owned. Device billing and motion verification are not implied by publication.
+> **1.5.0 (2026-11-07):** Device-side lifecycle scheduling, reliable purchase delivery and safe presentation after screen closure. Existing billing remains app-owned.
 
-> **1.3.1 delivery behavior (2026-10-30):** The Flutter SDK validates delivery with the server before every presentation, including prepared views. Disabled triggers/paywalls and holdout decisions must not open a native/default fallback. Cached content is not shown on network failure. Hidden prepared views detach after loading; animations and media pause while hidden/backgrounded. Keep `MySuperWallHost`. Prewarming avoids HTML loading work, but a network decision is still required. Dashboard changes take effect on the next delivery request, not by closing an already-open screen.
+> **Delivery behavior (1.5.0):** The backend can authorize a matching delivery decision for up to 30 seconds. `MySuperWallHost` revalidates expired prepared decisions at presentation; idle host ticks do not renew them. All audience inputs vary the decision. Display limits, server-owned history, lifecycle/follow-up delivery and test users retain live checks. Expired decisions, disk content and failed requests cannot authorize display. Dashboard changes apply on renewal or expiry (within the 30-second decision window); open paywalls keep their current content and animation. Older servers retain live delivery. Hidden prepared views detach after loading; animations and media pause while hidden/backgrounded.
 
 [![MySuperWall — Make it beautiful. Make it live.](https://mysuperwall.com/assets/sdk/flutter-readme-hero-v1.png)](https://mysuperwall.com)
 
@@ -215,7 +215,52 @@ Purchase success rules follow host-confirmed completion calls. Existing `setAuto
 <details>
 <summary><strong>Caching, prefetching &amp; lifecycle triggers</strong></summary>
 
-The SDK caches content on disk. Use prefetching and `MySuperWallHost` to prepare views before presentation. Every presentation still requires a successful server delivery decision; offline cached content cannot authorize display.
+The SDK caches content on disk. Use prefetching and `MySuperWallHost` to prepare views before presentation. Display requires either a live server decision or an unexpired session-only authorization issued by a compatible backend. Offline disk content alone cannot authorize display; network errors never extend an authorization.
+
+### Reliable purchase reporting (working source)
+
+RevenueCat dashboard/webhook integration is optional. The host app must feed its
+billing provider's confirmed results and transaction updates into the Flutter
+SDK. Purchase events are written to the local outbox before HTTP delivery; APIs
+return after local persistence, without waiting for networking. On restart and
+foreground the SDK retries, retaining events until persistence is acknowledged.
+Store transaction identity deduplicates direct callbacks, listener updates and
+retries. Occurrence timestamps keep delayed events on their original day.
+
+SDK purchase buttons journal a pending attempt before invoking `onPurchase`.
+For checkouts outside SDK paywalls, await this before opening the store:
+
+```dart
+await client.beginPurchaseTracking(productId: productId);
+```
+
+On a confirmed purchase result, report the store-issued transaction identifier
+(not an original subscription ID, purchase token or receipt):
+
+```dart
+await client.completePurchaseTracking(
+  productId: transaction.productId,
+  storeTransactionId: transaction.id,
+  purchasedAt: transaction.purchasedAt,
+  onlyIfPending: false, // confirmed result from the checkout just invoked
+);
+```
+
+Feed pending-payment completions from the billing SDK's update listener, and
+reconcile on startup/foreground using the default `onlyIfPending: true`. Updates
+require a matching app/user/product attempt from the last 30 days whose start
+precedes the transaction; they are not a historical purchase import. Skip
+renewals, family-shared access and restored ownership. On a confirmed user
+cancellation call `cancelPurchaseTracking(productId: productId)` (also performed
+by `trackPurchaseCancelled`). Preserve attempts for pending/ambiguous outcomes.
+
+Use one reporting path per result. Existing `trackPurchaseSuccess` remains
+compatible and accepts optional `storeTransactionId` and `purchasedAt`; pass the
+same transaction ID whenever a provider can repeat a completion. A callback
+without a store ID cannot deduplicate independently recreated callback events.
+Purchase tracking remains SDK-reported analytics, not receipt verification or
+entitlement authority. A billing adapter is still required; the SDK cannot
+observe another provider's completed transactions without that integration.
 
 Built-in lifecycle triggers include:
 

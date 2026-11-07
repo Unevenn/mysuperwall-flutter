@@ -4,6 +4,8 @@ class PaywallDiagnosticPolicy {
   static bool isExpectedNoDisplay(String? reason) => const {
     'trigger_not_found',
     'holdout',
+    'display_limit',
+    'schedule_not_reached',
     'paywall_not_assigned',
     'paywall_inactive',
     'no_matching_rule',

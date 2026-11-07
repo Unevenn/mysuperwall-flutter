@@ -299,6 +299,7 @@ class _MySuperWallHostState extends State<MySuperWallHost>
   @override
   void dispose() {
     _lifecycleTimer?.cancel();
+    if (identical(_lifecycleOwner, this)) MySuperWallClient.registerLifecycleWake(null);
     MySuperWallClient.registerHostContextProvider(this, null);
     if (identical(_lifecycleOwner, this) && MySuperWallClient.isInitialized) {
       unawaited(
@@ -338,6 +339,9 @@ class _MySuperWallHostState extends State<MySuperWallHost>
     );
     WidgetsBinding.instance.addPostFrameCallback(
       (_) => unawaited(_runLifecycle()),
+    );
+    MySuperWallClient.registerLifecycleWake(
+      () => unawaited(_runLifecycle(refreshSignals: false)),
     );
     _lifecycleTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {

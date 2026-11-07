@@ -68,6 +68,11 @@ class PaywallView extends StatefulWidget {
     bool disposeProvidedPreparedController = false,
     bool trackDismissInternally = true,
   }) async {
+    // Callers do not await this, so an error here would reach nobody who can handle it.
+    if (!context.mounted) {
+      if (disposeProvidedPreparedController) preparedController?.dispose();
+      return;
+    }
     dismissCurrent();
 
     PaywallView routeBuilder(BuildContext context) => PaywallView(

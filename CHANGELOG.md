@@ -1,3 +1,40 @@
+## 1.5.0 — 2026-11-07
+
+- Do not open a paywall on a screen that closed while it was being prepared. This
+  threw an error the app could not catch.
+- A wrong device clock no longer loses a purchase: direct billing results are
+  accepted whatever the clock says, and updates allow 12 hours of difference.
+  One checkout reported with two transaction IDs counts once. A damaged purchase
+  journal starts over instead of stopping tracking. The offline queue is limited
+  to 500 events and never drops purchases; rejected purchases retry at launch.
+- Stop renewing prepared paywall decisions on the 15-second host tick. A prepared
+  paywall now asks the server when it is about to be shown, once its 30-second
+  decision has expired, so idle apps make no renewal requests.
+- Decide lifecycle triggers on the device: the panel's start, wait and repeat
+  settings arrive in the manifest, and the server is asked only when a paywall
+  can actually be shown. The periodic host tick no longer fetches the manifest
+  (at most once per 10 minutes), a declined trigger is not requested again on
+  every tick, and `lifecycle_status` diagnostics are limited to configured,
+  eligible triggers plus one daily activity signal.
+- Persist purchase events before delivery, retain them until explicit server
+  acknowledgement, and replay at initialization/foreground. Preserve original
+  occurrence time and deduplicate confirmed purchases by store transaction ID.
+- Add `beginPurchaseTracking`, `completePurchaseTracking`, and
+  `cancelPurchaseTracking` for billing SDK update listeners and pending-payment
+  recovery. Persist attempt context across restarts; do not infer conversions
+  from restored ownership. Purchase callbacks complete after local persistence.
+- Keep invalid batch events locally for diagnosis without blocking valid events;
+  malformed/partial responses never discard unacknowledged purchases.
+- Reuse server-authorized delivery decisions for up to 30 seconds, varying by
+  all audience inputs. Renew warm decisions in the foreground without waiting
+  on a delivery request for every tap. Legacy servers retain live delivery.
+- Keep history-based audiences, display limits, lifecycle/follow-up delivery and
+  test users on live decisions; invalidate reuse on identity, locale, country,
+  entitlement, product or manifest changes. Leases are never persisted to disk.
+- Reuse identical prepared content with targeting metadata. Preserve image
+  preparation and server-controlled animation. Renewal never replaces an open
+  paywall or records a user tap/delivery; cached taps retain queued analytics.
+
 ## 1.4.0 — 2026-11-01
 
 - Add automatic lifecycle history, configurable session/day/active-minute thresholds,

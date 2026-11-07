@@ -25,7 +25,10 @@ class OfflineEventQueue {
   final int maxBatchSize;
 
   static const String _storageKey = 'mysuperwall_offline_events_queue';
+  static const int _maxStoredEvents = 500;
+  static const Set<String> _conversionTypes = {'purchase', 'purchase_success'};
   final List<Map<String, dynamic>> _queue = [];
+  final Set<String> _directDeliveries = {};
   Timer? _timer;
   bool _isFlushing = false;
   bool _disposed = false;
@@ -71,8 +74,14 @@ class OfflineEventQueue {
               event['eventId'] = const Uuid().v4();
             }
             if (event['_queueScope'] == null) event['_legacyUnscoped'] = true;
+            // A purchase gets another chance each launch: the server may accept
+            // today what an earlier version refused.
+            if (_conversionTypes.contains(event['type'])) {
+              event.remove('_rejected');
+            }
             _queue.add(event);
           }
+          _trim();
           if (_queue.any((event) => event['_legacyUnscoped'] == true)) {
             _logger.w(
               '[MySuperWall] Legacy offline events without a confirmed app/user scope are retained locally until safely attributable.',
@@ -86,21 +95,23 @@ class OfflineEventQueue {
     }
   }
 
-  Future<void> _saveQueueToDisk() {
+  Future<bool> _saveQueueToDisk() {
     // Serialize writes and take the snapshot when each write starts. An older
     // async setString can never finish after, and overwrite, a newer snapshot.
-    _persistence = _persistence.then((_) async {
+    final write = _persistence.then((_) async {
       try {
         if (_queue.isEmpty) {
-          await preferences.remove(_storageKey);
+          return await preferences.remove(_storageKey);
         } else {
-          await preferences.setString(_storageKey, jsonEncode(_queue));
+          return await preferences.setString(_storageKey, jsonEncode(_queue));
         }
       } catch (e) {
         _logger.w('[MySuperWall] Failed to persist offline events to disk: $e');
+        return false;
       }
     });
-    return _persistence;
+    _persistence = write.then<void>((_) {});
+    return write;
   }
 
   void _startPeriodicFlush() {
@@ -115,17 +126,62 @@ class OfflineEventQueue {
   /// Enqueues an analytics event for fire-and-forget background sync.
   void enqueue(Map<String, dynamic> event) {
     if (_disposed) return;
+    _add(event);
+    unawaited(_saveQueueToDisk());
+    if (_queue.length >= maxBatchSize && !_isFlushing) unawaited(flush());
+  }
+
+  void _add(Map<String, dynamic> event) {
     event = Map<String, dynamic>.from(event);
     event['eventId'] ??= const Uuid().v4();
     final connection = _connection;
     if (connection != null) event['_queueScope'] = _scope(connection);
     event['timestamp'] ??= DateTime.now().toUtc().toIso8601String();
-    _queue.add(event);
-    _saveQueueToDisk();
-
-    if (_queue.length >= maxBatchSize && !_isFlushing) {
-      flush();
+    if (!_queue.any((stored) => stored['eventId'] == event['eventId'])) {
+      _queue.add(event);
+      _trim();
     }
+  }
+
+  /// Keeps storage bounded. Rejected rows go first, then the oldest analytics;
+  /// purchases are never dropped.
+  void _trim() {
+    bool removeFirst(bool Function(Map<String, dynamic>) test) {
+      final index = _queue.indexWhere(test);
+      if (index < 0) return false;
+      _queue.removeAt(index);
+      return true;
+    }
+
+    bool droppable(Map<String, dynamic> event) =>
+        !_conversionTypes.contains(event['type']) &&
+        !_directDeliveries.contains(event['eventId']);
+    while (_queue.length > _maxStoredEvents) {
+      if (removeFirst((event) => droppable(event) && event['_rejected'] == true)) {
+        continue;
+      }
+      if (!removeFirst(droppable)) return;
+    }
+  }
+
+  /// Write-ahead delivery: no purchase HTTP request precedes this disk write.
+  Future<bool> enqueuePersisted(Map<String, dynamic> event) async {
+    if (_disposed) return false;
+    final id = event['eventId'];
+    if (id is! String || id.isEmpty) return false;
+    _directDeliveries.add(id);
+    _add(event);
+    return _saveQueueToDisk();
+  }
+
+  Future<void> acknowledge(String eventId) async {
+    if (_disposed) return;
+    _queue.removeWhere((event) => event['eventId'] == eventId);
+    await _saveQueueToDisk();
+  }
+
+  void releaseDirectDelivery(String eventId) {
+    _directDeliveries.remove(eventId);
   }
 
   /// Flushes pending events to backend.
@@ -168,11 +224,16 @@ class OfflineEventQueue {
         }
       }
       final batch = _queue
-          .where((event) => event['_queueScope'] == connectionScope)
+          .where(
+            (event) =>
+                event['_queueScope'] == connectionScope &&
+                event['_rejected'] != true &&
+                !_directDeliveries.contains(event['eventId']),
+          )
           .take(maxBatchSize)
           .toList();
       if (batch.isEmpty) return;
-      await _saveQueueToDisk();
+      if (!await _saveQueueToDisk()) return;
       final uri = Uri.parse('${connection['baseUrl']}paywall/events/batch');
       final payload = {
         for (final entry in connection.entries)
@@ -182,7 +243,8 @@ class OfflineEventQueue {
               (event) => {
                 for (final entry in event.entries)
                   if (entry.key != '_queueScope' &&
-                      entry.key != '_legacyUnscoped')
+                      entry.key != '_legacyUnscoped' &&
+                      entry.key != '_rejected')
                     entry.key: entry.value,
               },
             )
@@ -197,9 +259,30 @@ class OfflineEventQueue {
           )
           .timeout(const Duration(seconds: 10));
 
+      if (_disposed) return;
       if (response.statusCode >= 200 && response.statusCode < 300) {
-        final acknowledged = batch.map((event) => event['eventId']).toSet();
+        final decoded = jsonDecode(response.body);
+        if (decoded is! Map<String, dynamic> || decoded['ok'] != true) return;
+        final ids = decoded['acknowledgedEventIds'];
+        final batchIds = batch.map((event) => event['eventId']).toSet();
+        final acknowledged = ids is List
+            ? ids.whereType<String>().where(batchIds.contains).toSet()
+            : decoded['invalid'] == 0 && decoded['processed'] == batch.length
+            ? batchIds
+            : <Object?>{};
         _queue.removeWhere((event) => acknowledged.contains(event['eventId']));
+        final rejected = decoded['rejectedEventIds'];
+        if (rejected is List) {
+          final rejectedIds = rejected
+              .whereType<String>()
+              .where(batchIds.contains)
+              .toSet();
+          for (final event in batch) {
+            // Retain rejected events for diagnosis without starving valid ones.
+            if (rejectedIds.contains(event['eventId']))
+              event['_rejected'] = true;
+          }
+        }
         await _saveQueueToDisk();
       }
     } catch (e) {
